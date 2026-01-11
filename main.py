@@ -57,7 +57,6 @@ class MyBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        # Register persistent views
         self.add_view(TicketControlPanelView())
         self.add_view(TicketActionView())
 
@@ -194,7 +193,14 @@ class TicketControlPanelView(View):
 
         embed = discord.Embed(title=f"{ticket_type} Support Request", description=f"Hello {interaction.user.mention}!\n\n**Please provide details:**\n{questions}", color=discord.Color.blue())
         await channel.send(embed=embed, view=TicketActionView(show_claim=(ticket_type != "Complaint")))
-        await interaction.followup.send(f"Ticket created: {channel.mention}", ephemeral=True)
+        
+        # --- FIX: Message is now Ephemeral AND deletes itself after 10 seconds ---
+        msg = await interaction.followup.send(f"Ticket created: {channel.mention}", ephemeral=True)
+        await asyncio.sleep(10)
+        try:
+            await msg.delete()
+        except:
+            pass
 
     @discord.ui.button(label="Server Support", style=discord.ButtonStyle.primary, custom_id="btn_server", emoji="🖥️")
     async def server_support(self, interaction: discord.Interaction, button: Button): 
@@ -234,18 +240,14 @@ async def check_inactive_tickets():
 @bot.event
 async def on_ready():
     print(f"--- BOT IS ONLINE AS {bot.user.name} ---")
-    
-    # Register views
     bot.add_view(TicketControlPanelView())
     bot.add_view(TicketActionView())
 
-    # SYNC COMMANDS
     try:
-        print(f"Attempting to sync commands to Guild ID: {GUILD_ID}...")
         guild = discord.Object(id=GUILD_ID)
         bot.tree.copy_global_to(guild=guild)
-        synced = await bot.tree.sync(guild=guild)
-        print(f"SUCCESS: Synced {len(synced)} command(s) to guild {GUILD_ID}")
+        await bot.tree.sync(guild=guild)
+        print(f"SUCCESS: Synced commands to guild {GUILD_ID}")
     except Exception as e:
         print(f"SYNC ERROR: {e}")
 
@@ -256,18 +258,18 @@ async def on_ready():
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def sync(ctx):
-    """Type !sync if slash commands are missing"""
     try:
         guild = discord.Object(id=GUILD_ID)
         bot.tree.copy_global_to(guild=guild)
         await bot.tree.sync(guild=guild)
-        await ctx.send(f"✅ Commands synced to this guild!")
+        await ctx.send(f"✅ Commands synced!")
     except Exception as e:
         await ctx.send(f"❌ Sync failed: {e}")
 
 # --- SLASH COMMAND ---
+# --- FIX: Added default_permissions to hide from non-admins ---
 @bot.tree.command(name="setup_tickets", description="Setup the ticket support panel")
-@commands.has_permissions(administrator=True)
+@discord.app_commands.default_permissions(administrator=True)
 async def setup_tickets(interaction: discord.Interaction):
     embed = discord.Embed(
         title="Support Center", 
