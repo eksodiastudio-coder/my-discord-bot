@@ -9,15 +9,14 @@ from discord.ui import Button, View
 from flask import Flask
 from threading import Thread
 
-# --- KOYEB WEB SERVER SETUP (Required for 24/7 Hosting) ---
+# --- KOYEB WEB SERVER SETUP ---
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "Ticket Bot is Online and Healthy!"
+    return "Ticket Bot is Online!"
 
 def run_web_server():
-    # Koyeb uses port 8080 by default
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
@@ -51,14 +50,14 @@ MACROS = {
     "closing": "Is there anything else I can help with before closing?" 
 }
 
-# --- BOT INITIALIZATION ---
+# --- BOT SETUP ---
 class MyBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.all()
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        # Register persistent views so buttons work after bot restarts
+        # Register persistent views
         self.add_view(TicketControlPanelView())
         self.add_view(TicketActionView())
 
@@ -145,7 +144,7 @@ class FeedbackRatingView(View):
 class TicketActionView(View):
     def __init__(self, show_claim: bool = True):
         super().__init__(timeout=None)
-        if not show_claim: 
+        if not show_claim:
             for item in self.children:
                 if item.custom_id == "claim_ticket":
                     self.remove_item(item)
@@ -234,21 +233,39 @@ async def check_inactive_tickets():
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user.name}")
+    print(f"--- BOT IS ONLINE AS {bot.user.name} ---")
     
-    # --- SYNC SLASH COMMANDS ---
+    # Register views
+    bot.add_view(TicketControlPanelView())
+    bot.add_view(TicketActionView())
+
+    # SYNC COMMANDS
     try:
+        print(f"Attempting to sync commands to Guild ID: {GUILD_ID}...")
         guild = discord.Object(id=GUILD_ID)
         bot.tree.copy_global_to(guild=guild)
-        await bot.tree.sync(guild=guild)
-        print(f"Synced slash commands to guild {GUILD_ID}")
+        synced = await bot.tree.sync(guild=guild)
+        print(f"SUCCESS: Synced {len(synced)} command(s) to guild {GUILD_ID}")
     except Exception as e:
-        print(f"Error syncing commands: {e}")
+        print(f"SYNC ERROR: {e}")
 
     if not check_inactive_tickets.is_running():
         check_inactive_tickets.start()
 
-# --- SLASH COMMANDS ---
+# --- PREFIX COMMAND FOR MANUAL SYNC ---
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def sync(ctx):
+    """Type !sync if slash commands are missing"""
+    try:
+        guild = discord.Object(id=GUILD_ID)
+        bot.tree.copy_global_to(guild=guild)
+        await bot.tree.sync(guild=guild)
+        await ctx.send(f"✅ Commands synced to this guild!")
+    except Exception as e:
+        await ctx.send(f"❌ Sync failed: {e}")
+
+# --- SLASH COMMAND ---
 @bot.tree.command(name="setup_tickets", description="Setup the ticket support panel")
 @commands.has_permissions(administrator=True)
 async def setup_tickets(interaction: discord.Interaction):
@@ -265,10 +282,10 @@ async def setup_tickets(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=embed, view=TicketControlPanelView())
 
-# --- MAIN EXECUTION ---
+# --- EXECUTION ---
 if __name__ == "__main__":
-    keep_alive()  # Starts the Flask web server
+    keep_alive()
     if BOT_TOKEN:
         bot.run(BOT_TOKEN)
     else:
-        print("No DISCORD_TOKEN found in environment variables!")
+        print("CRITICAL: No DISCORD_TOKEN found!")
