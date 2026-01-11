@@ -282,11 +282,16 @@ async def setup_tickets(interaction: discord.Interaction):
             "A private channel will be opened for you to speak with our team.\n\n"
             "🖥️ **Server Support**\nFor issues related to the Discord server itself (roles, channels, members).\n\n"
             "🎮 **Game Support**\nFor bugs, questions, or issues related to the game.\n\n"
-            "⚖️ **File a Complaint**\n*Supervisor-Only:* Use this to file a formal complaint about a user or situation."
+            "⚖️ **File a Complaint**\n*Supervisor-Only:* Use this to file a formal complaint about a staff member."
         ), 
         color=discord.Color.blue()
     )
-    await interaction.response.send_message(embed=embed, view=TicketControlPanelView())
+    
+    # 1. Send the panel as a standard message in the channel (No "User used /command" header)
+    await interaction.channel.send(embed=embed, view=TicketControlPanelView())
+    
+    # 2. Respond to the interaction ephemerally so the command usage is hidden from everyone else
+    await interaction.response.send_message("✅ Ticket panel has been posted successfully!", ephemeral=True)
 
 # --- EXECUTION ---
 if __name__ == "__main__":
@@ -295,3 +300,4 @@ if __name__ == "__main__":
         bot.run(BOT_TOKEN)
     else:
         print("CRITICAL: No DISCORD_TOKEN found!")
+
