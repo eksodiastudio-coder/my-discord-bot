@@ -1,18 +1,21 @@
 import discord
-from discord.ext import commands
-import os
-from flask import Flask
-from threading import Thread
+import random
+import datetime
+import io
+import asyncio
+import os # Added for environment variables
+from discord.ext import commands, tasks
+from discord.ui import Button, View
+from flask import Flask # Added for Koyeb
+from threading import Thread # Added for Koyeb
 
-# 1. Flask Web Server (Required for Koyeb Free Tier)
+# --- KOYEB WEB SERVER SETUP ---
 app = Flask('')
-
 @app.route('/')
 def home():
-    return "Bot is online!"
+    return "Ticket Bot is Online!"
 
 def run_web_server():
-    # Koyeb gives you a 'PORT' environment variable, usually 8080
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
@@ -21,24 +24,230 @@ def keep_alive():
     t.daemon = True
     t.start()
 
-# 2. Discord Bot Setup
-TOKEN = os.getenv("DISCORD_TOKEN")
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+# --- Configuration ---
+# DO NOT paste your token here. Use the Environment Variable "DISCORD_TOKEN" in Koyeb.
+BOT_TOKEN = os.getenv("DISCORD_TOKEN") 
+
+GUILD_ID = 1428466555850719347  
+TICKET_CATEGORY_ID = 1428466916166598818 
+STAFF_ROLE_ID = 1428466660012200036     
+LOG_CHANNEL_ID = 1428478091474505750      
+
+SUPERVISOR_ROLE_ID = 1428489953477922996  
+INACTIVE_ROLE_ID = 1428490017420087478    
+COMPLAINT_CATEGORY_ID = 1428497122759671881 
+COMPLAINT_LOG_CHANNEL_ID = 1428499253952774176
+FEEDBACK_LOG_CHANNEL_ID = 1430296240528294049 
+
+INACTIVITY_WARN_AFTER_HOURS = 24
+INACTIVITY_CLOSE_AFTER_HOURS = 48
+CHECK_INTERVAL_MINUTES = 5
+
+# --- Canned Responses ---
+MACROS = { 
+    "welcome": "Hello! How can I assist you today?", 
+    "bug_report_questions": "1. What is the bug?\n2. Where does it happen?\n3. Steps to reproduce?", 
+    "server_issue_questions": "Please describe the server issue and provide any screenshots if possible.", 
+    "closing": "Is there anything else I can help with before closing?" 
+}
+
+bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
+
+# --- Helper Functions ---
+def is_staff_or_supervisor(interaction: discord.Interaction) -> bool:
+    staff_role = interaction.guild.get_role(STAFF_ROLE_ID)
+    supervisor_role = interaction.guild.get_role(SUPERVISOR_ROLE_ID)
+    return (staff_role and staff_role in interaction.user.roles) or (supervisor_role and supervisor_role in interaction.user.roles)
+
+# --- Logging & Closing ---
+async def close_and_log_ticket(interaction_or_channel, closer_member, reason="Ticket Closed"):
+    channel = interaction_or_channel if isinstance(interaction_or_channel, discord.TextChannel) else interaction_or_channel.channel
+    guild = channel.guild
+    
+    log_channel_id = COMPLAINT_LOG_CHANNEL_ID if channel.category_id == COMPLAINT_CATEGORY_ID else LOG_CHANNEL_ID
+    log_channel = guild.get_channel(log_channel_id)
+
+    messages = []
+    async for message in channel.history(limit=None, oldest_first=True):
+        messages.append(f"[{message.created_at.strftime('%Y-%m-%d %H:%M:%S')}] {message.author}: {message.clean_content}")
+    
+    full_transcript = "\n".join(messages)
+    transcript_file = discord.File(io.StringIO(full_transcript), filename=f"transcript-{channel.name}.txt")
+    
+    ticket_id = "N/A"
+    owner_member = None
+    if channel.topic:
+        if "| ID: " in channel.topic: 
+            ticket_id = channel.topic.split("| ID: ")[1].strip()
+        if "Ticket for " in channel.topic:
+            try: 
+                owner_id = int(channel.topic.split("for ")[1].split(" |")[0].strip())
+                owner_member = await guild.fetch_member(owner_id)
+            except: pass
+
+    log_embed = discord.Embed(title="Ticket Closed", color=discord.Color.orange(), timestamp=datetime.datetime.utcnow())
+    log_embed.add_field(name="Ticket ID", value=f"`{ticket_id}`")
+    log_embed.add_field(name="Opened By", value=owner_member.mention if owner_member else "Unknown")
+    log_embed.add_field(name="Closed By", value=closer_member.mention)
+    
+    if log_channel: 
+        await log_channel.send(content=f"Ticket ID: `{ticket_id}`", embed=log_embed, file=transcript_file)
+    
+    if owner_member and channel.category_id != COMPLAINT_CATEGORY_ID:
+        try: 
+            await owner_member.send(f"Your ticket (`{ticket_id}`) has been closed. Rate your experience:", view=FeedbackRatingView(ticket_id, closer_member))
+        except: pass
+
+    await channel.send("This ticket is logged and will be deleted in 5 seconds.")
+    await asyncio.sleep(5)
+    await channel.delete()
+
+# --- Views ---
+class FeedbackRatingView(View):
+    def __init__(self, ticket_id: str, closer_member: discord.Member):
+        super().__init__(timeout=None)
+        self.ticket_id = ticket_id
+        self.closer_member = closer_member
+
+    async def _process_rating(self, i, rating):
+        for item in self.children: item.disabled = True
+        await i.response.edit_message(content=f"Thank you! You rated this **{rating}/5 stars**.", view=self)
+        feedback_channel = i.client.get_channel(FEEDBACK_LOG_CHANNEL_ID)
+        if feedback_channel:
+            embed = discord.Embed(title="New Support Feedback", color=discord.Color.gold())
+            embed.add_field(name="Rating", value=f"{'⭐' * rating} ({rating}/5)")
+            embed.add_field(name="Ticket ID", value=f"`{self.ticket_id}`")
+            embed.add_field(name="Handled By", value=self.closer_member.mention)
+            await feedback_channel.send(embed=embed)
+
+    @discord.ui.button(label="1", style=discord.ButtonStyle.danger)
+    async def r1(self, b, i): await self._process_rating(i, 1)
+    @discord.ui.button(label="2", style=discord.ButtonStyle.danger)
+    async def r2(self, b, i): await self._process_rating(i, 2)
+    @discord.ui.button(label="3", style=discord.ButtonStyle.secondary)
+    async def r3(self, b, i): await self._process_rating(i, 3)
+    @discord.ui.button(label="4", style=discord.ButtonStyle.success)
+    async def r4(self, b, i): await self._process_rating(i, 4)
+    @discord.ui.button(label="5", style=discord.ButtonStyle.success)
+    async def r5(self, b, i): await self._process_rating(i, 5)
+
+class TicketActionView(View):
+    def __init__(self, show_claim: bool = True):
+        super().__init__(timeout=None)
+        if not show_claim: self.remove_item(self.claim_ticket_button)
+
+    @discord.ui.button(label="Claim", style=discord.ButtonStyle.success, custom_id="claim_ticket", emoji="🙋")
+    async def claim_ticket_button(self, button: Button, interaction: discord.Interaction):
+        if not is_staff_or_supervisor(interaction): 
+            return await interaction.response.send_message("Only staff can claim tickets.", ephemeral=True, delete_after=5)
+        button.disabled = True
+        button.label = f"Claimed by {interaction.user.display_name}"
+        await interaction.message.edit(view=self)
+        await interaction.response.send_message(f"Ticket claimed by {interaction.user.mention}")
+
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="close_ticket", emoji="🔒")
+    async def close_ticket_button(self, button: Button, interaction: discord.Interaction):
+        if not is_staff_or_supervisor(interaction): 
+            return await interaction.response.send_message("Permission denied.", ephemeral=True, delete_after=5)
+        await interaction.response.send_message("Closing ticket...")
+        await close_and_log_ticket(interaction, interaction.user)
+
+class TicketControlPanelView(View):
+    def __init__(self): super().__init__(timeout=None)
+
+    async def _create_ticket(self, interaction, ticket_type, questions, category_id, roles_to_add):
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        category = guild.get_channel(category_id)
+        
+        for channel in category.text_channels:
+            if channel.topic and str(interaction.user.id) in channel.topic:
+                return await interaction.followup.send(f"You already have a ticket here: {channel.mention}", ephemeral=True, delete_after=10)
+
+        ticket_id = f"{ticket_type[:3].upper()}-{random.randint(1000, 9999)}-{random.randint(100, 999)}"
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
+        }
+        for role in roles_to_add:
+            if role: overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+
+        channel = await category.create_text_channel(
+            name=f"{ticket_type}-{interaction.user.name}",
+            overwrites=overwrites,
+            topic=f"Ticket for {interaction.user.id} | ID: {ticket_id}"
+        )
+
+        embed = discord.Embed(title=f"{ticket_type} Support Request", description=f"Hello {interaction.user.mention}!\n\n**Please provide details:**\n{questions}", color=discord.Color.blue())
+        await channel.send(embed=embed, view=TicketActionView(show_claim=(ticket_type != "Complaint")))
+        
+        await interaction.followup.send(f"Ticket created: {channel.mention}", ephemeral=True, delete_after=10)
+
+    @discord.ui.button(label="Server Support", style=discord.ButtonStyle.primary, custom_id="btn_server", emoji="🖥️")
+    async def server_support(self, b, i): 
+        await self._create_ticket(i, "Server", MACROS["server_issue_questions"], TICKET_CATEGORY_ID, [i.guild.get_role(STAFF_ROLE_ID)])
+
+    @discord.ui.button(label="Game Support", style=discord.ButtonStyle.success, custom_id="btn_game", emoji="🎮")
+    async def game_support(self, b, i): 
+        await self._create_ticket(i, "Game", MACROS["bug_report_questions"], TICKET_CATEGORY_ID, [i.guild.get_role(STAFF_ROLE_ID)])
+
+    @discord.ui.button(label="File a Complaint", style=discord.ButtonStyle.danger, custom_id="btn_complaint", emoji="⚖️")
+    async def complaint(self, b, i): 
+        await self._create_ticket(i, "Complaint", "Describe your complaint in detail.", COMPLAINT_CATEGORY_ID, [i.guild.get_role(SUPERVISOR_ROLE_ID)])
+
+# --- Tasks & Events ---
+@tasks.loop(minutes=CHECK_INTERVAL_MINUTES)
+async def check_inactive_tickets():
+    await bot.wait_until_ready()
+    guild = bot.get_guild(GUILD_ID)
+    if not guild: return
+    category = guild.get_channel(TICKET_CATEGORY_ID)
+    if not category: return
+    now, warn_delta, close_delta = discord.utils.utcnow(), datetime.timedelta(hours=INACTIVITY_WARN_AFTER_HOURS), datetime.timedelta(hours=INACTIVITY_CLOSE_AFTER_HOURS)
+    
+    for channel in category.text_channels:
+        if not channel.topic or "Ticket for" not in channel.topic: continue
+        try:
+            msgs = [m async for m in channel.history(limit=1)]
+            if not msgs: continue
+            last_msg = msgs[0]
+            if now - last_msg.created_at > close_delta:
+                await close_and_log_ticket(channel, bot.user, "Inactivity")
+            elif now - last_msg.created_at > warn_delta:
+                if not (last_msg.author == bot.user):
+                    await channel.send("This ticket is inactive and will be closed soon.")
+        except: continue
 
 @bot.event
 async def on_ready():
-    print(f'Logged in as {bot.user.name}')
+    print(f"Logged in as {bot.user.name}")
+    bot.add_view(TicketControlPanelView())
+    bot.add_view(TicketActionView())
+    if not check_inactive_tickets.is_running():
+        check_inactive_tickets.start()
 
-@bot.command()
-async def ping(ctx):
-    await ctx.send("Pong!")
+@bot.slash_command(name="setup_tickets", guild_ids=[GUILD_ID])
+@commands.has_permissions(administrator=True)
+async def setup_tickets(ctx):
+    embed = discord.Embed(
+        title="Support Center", 
+        description=(
+            "Please select the appropriate category for your support request below. "
+            "A private channel will be opened for you to speak with our team.\n\n"
+            "🖥️ **Server Support**\nFor issues related to the Discord server itself (roles, channels, members).\n\n"
+            "🎮 **Game Support**\nFor bugs, questions, or issues related to the game.\n\n"
+            "⚖️ **File a Complaint**\n*Supervisor-Only:* Use this to file a formal complaint about a user or situation."
+        ), 
+        color=discord.Color.blue()
+    )
+    await ctx.send(embed=embed, view=TicketControlPanelView())
+    await ctx.respond("Panel Created!", ephemeral=True, delete_after=5)
 
-# 3. Execution
+# --- START BOT ---
 if __name__ == "__main__":
-    keep_alive()  # Start the web server
-    if TOKEN:
-        bot.run(TOKEN)
+    keep_alive() # Starts Flask on Port 8080
+    if BOT_TOKEN:
+        bot.run(BOT_TOKEN)
     else:
-        print("No DISCORD_TOKEN found!")
+        print("FATAL ERROR: DISCORD_TOKEN environment variable not found.")
