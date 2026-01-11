@@ -43,11 +43,38 @@ INACTIVITY_WARN_AFTER_HOURS = 24
 INACTIVITY_CLOSE_AFTER_HOURS = 48
 CHECK_INTERVAL_MINUTES = 5
 
-# --- CANNED RESPONSES ---
+# --- NEW MACROS (UPDATED TEXT) ---
 MACROS = { 
     "welcome": "Hello! How can I assist you today?", 
-    "bug_report_questions": "1. What is the bug?\n2. Where does it happen?\n3. Steps to reproduce?", 
-    "server_issue_questions": "Please describe the server issue and provide any screenshots if possible.", 
+    "game_support_questions": (
+        "1. **Appealing Ban please follow the format:**\n"
+        "Roblox Username:\n"
+        "Date of Ban:\n"
+        "Reason of Ban:\n"
+        "Appeal(Reasoning on why we should accept the appeal submission):\n\n"
+        "2. **Reporting a Player:**\n"
+        "Roblox Username(of the player you want to report):\n"
+        "Type of Abuse(Hacking, glitching or abusing a bug):\n"
+        "Evidence(photos or videos):"
+    ), 
+    "server_issue_questions": (
+        "1. **Appealing a Warning please follow the format:**\n"
+        "User/ID:\n"
+        "Reason of the warning:\n"
+        "Date of the warning:\n"
+        "Appeal(Reasoning on why we should accept the appeal submission):\n\n"
+        "2. **Appealing a Mute please follow the format:**\n"
+        "User/ID:\n"
+        "Reason of the mute:\n"
+        "Date of the mute:\n"
+        "Appeal(Reasoning on why we should accept the appeal submission):\n\n"
+        "3. **Appealing a Ban please follow the format:**\n"
+        "User/ID:\n"
+        "Reason of ban:\n"
+        "Date of ban:\n"
+        "Appeal(Reasoning on why we should accept the appeal submission):\n\n"
+        "4. **Reporting a member** please provide the reason why and any evidence to support your claim."
+    ), 
     "closing": "Is there anything else I can help with before closing?" 
 }
 
@@ -68,7 +95,6 @@ def is_staff_or_supervisor(interaction: discord.Interaction) -> bool:
     staff_role = interaction.guild.get_role(STAFF_ROLE_ID)
     staff_lead_role = interaction.guild.get_role(STAFF_LEAD_ROLE_ID)
     supervisor_role = interaction.guild.get_role(SUPERVISOR_ROLE_ID)
-    
     user_roles = interaction.user.roles
     return (staff_role in user_roles) or (staff_lead_role in user_roles) or (supervisor_role in user_roles)
 
@@ -195,7 +221,7 @@ class TicketControlPanelView(View):
             topic=f"Ticket for {interaction.user.id} | ID: {ticket_id}"
         )
 
-        embed = discord.Embed(title=f"{ticket_type} Support Request", description=f"Hello {interaction.user.mention}!\n\n**Please provide details:**\n{questions}", color=discord.Color.blue())
+        embed = discord.Embed(title=f"{ticket_type} Support Request", description=f"Hello {interaction.user.mention}!\n\n{questions}", color=discord.Color.blue())
         await channel.send(embed=embed, view=TicketActionView(show_claim=(ticket_type != "Complaint")))
         
         msg = await interaction.followup.send(f"Ticket created: {channel.mention}", ephemeral=True)
@@ -207,13 +233,11 @@ class TicketControlPanelView(View):
 
     @discord.ui.button(label="Server Support", style=discord.ButtonStyle.primary, custom_id="btn_server", emoji="🖥️")
     async def server_support(self, interaction: discord.Interaction, button: Button): 
-        # FIX: Put both roles inside the SAME list [role1, role2]
         await self._create_ticket(interaction, "Server", MACROS["server_issue_questions"], TICKET_CATEGORY_ID, [interaction.guild.get_role(STAFF_ROLE_ID), interaction.guild.get_role(STAFF_LEAD_ROLE_ID)])
 
     @discord.ui.button(label="Game Support", style=discord.ButtonStyle.success, custom_id="btn_game", emoji="🎮")
     async def game_support(self, interaction: discord.Interaction, button: Button): 
-        # FIX: Put both roles inside the SAME list [role1, role2]
-        await self._create_ticket(interaction, "Game", MACROS["bug_report_questions"], TICKET_CATEGORY_ID, [interaction.guild.get_role(STAFF_ROLE_ID), interaction.guild.get_role(STAFF_LEAD_ROLE_ID)])
+        await self._create_ticket(interaction, "Game", MACROS["game_support_questions"], TICKET_CATEGORY_ID, [interaction.guild.get_role(STAFF_ROLE_ID), interaction.guild.get_role(STAFF_LEAD_ROLE_ID)])
 
     @discord.ui.button(label="File a Complaint", style=discord.ButtonStyle.danger, custom_id="btn_complaint", emoji="⚖️")
     async def complaint(self, interaction: discord.Interaction, button: Button): 
@@ -271,7 +295,7 @@ async def sync(ctx):
     except Exception as e:
         await ctx.send(f"❌ Sync failed: {e}")
 
-# --- SLASH COMMAND ---
+# --- SLASH COMMAND (UPDATED NEW TEXT + CLEAN SEND) ---
 @bot.tree.command(name="setup_tickets", description="Setup the ticket support panel")
 @discord.app_commands.default_permissions(administrator=True)
 async def setup_tickets(interaction: discord.Interaction):
@@ -280,17 +304,15 @@ async def setup_tickets(interaction: discord.Interaction):
         description=(
             "Please select the appropriate category for your support request below. "
             "A private channel will be opened for you to speak with our team.\n\n"
-            "🖥️ **Server Support**\nFor issues related to the Discord server itself (roles, channels, members).\n\n"
-            "🎮 **Game Support**\nFor bugs, questions, or issues related to the game.\n\n"
-            "⚖️ **File a Complaint**\n*Supervisor-Only:* Use this to file a formal complaint about a staff member."
+            "🖥️ **Server Support**\nFor issues related to the server (mutes, warning, ban or reporting a member).\n\n"
+            "🎮 **Game Support**\nFor appealing ban, reporting glitch abusers/hackers, or issues related to the game.\n\n"
+            "⚖️ **File a Complaint**\n*Supervisor-Only:* Use this to file a formal complaint against a staff member."
         ), 
         color=discord.Color.blue()
     )
-    
-    # 1. Send the panel as a standard message in the channel (No "User used /command" header)
+    # Send clean message to channel
     await interaction.channel.send(embed=embed, view=TicketControlPanelView())
-    
-    # 2. Respond to the interaction ephemerally so the command usage is hidden from everyone else
+    # Reply privately to user
     await interaction.response.send_message("✅ Ticket panel has been posted successfully!", ephemeral=True)
 
 # --- EXECUTION ---
@@ -300,4 +322,3 @@ if __name__ == "__main__":
         bot.run(BOT_TOKEN)
     else:
         print("CRITICAL: No DISCORD_TOKEN found!")
-
