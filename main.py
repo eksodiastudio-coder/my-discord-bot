@@ -68,7 +68,9 @@ def is_staff_or_supervisor(interaction: discord.Interaction) -> bool:
     staff_role = interaction.guild.get_role(STAFF_ROLE_ID)
     staff_lead_role = interaction.guild.get_role(STAFF_LEAD_ROLE_ID)
     supervisor_role = interaction.guild.get_role(SUPERVISOR_ROLE_ID)
-    return (staff_role and staff_role in interaction.user.roles) or (supervisor_role and supervisor_role in interaction.user.roles) or (staff_lead_role and staff_lead_role in interaction.user.roles)
+    
+    user_roles = interaction.user.roles
+    return (staff_role in user_roles) or (staff_lead_role in user_roles) or (supervisor_role in user_roles)
 
 # --- LOGGING & CLOSING ---
 async def close_and_log_ticket(interaction_or_channel, closer_member, reason="Ticket Closed"):
@@ -196,7 +198,6 @@ class TicketControlPanelView(View):
         embed = discord.Embed(title=f"{ticket_type} Support Request", description=f"Hello {interaction.user.mention}!\n\n**Please provide details:**\n{questions}", color=discord.Color.blue())
         await channel.send(embed=embed, view=TicketActionView(show_claim=(ticket_type != "Complaint")))
         
-        # --- FIX: Message is now Ephemeral AND deletes itself after 10 seconds ---
         msg = await interaction.followup.send(f"Ticket created: {channel.mention}", ephemeral=True)
         await asyncio.sleep(10)
         try:
@@ -206,11 +207,13 @@ class TicketControlPanelView(View):
 
     @discord.ui.button(label="Server Support", style=discord.ButtonStyle.primary, custom_id="btn_server", emoji="🖥️")
     async def server_support(self, interaction: discord.Interaction, button: Button): 
-        await self._create_ticket(interaction, "Server", MACROS["server_issue_questions"], TICKET_CATEGORY_ID, [interaction.guild.get_role(STAFF_ROLE_ID)], [interaction.guild.get_role(STAFF_LEAD_ROLE_ID)])
+        # FIX: Put both roles inside the SAME list [role1, role2]
+        await self._create_ticket(interaction, "Server", MACROS["server_issue_questions"], TICKET_CATEGORY_ID, [interaction.guild.get_role(STAFF_ROLE_ID), interaction.guild.get_role(STAFF_LEAD_ROLE_ID)])
 
     @discord.ui.button(label="Game Support", style=discord.ButtonStyle.success, custom_id="btn_game", emoji="🎮")
     async def game_support(self, interaction: discord.Interaction, button: Button): 
-        await self._create_ticket(interaction, "Game", MACROS["bug_report_questions"], TICKET_CATEGORY_ID, [interaction.guild.get_role(STAFF_ROLE_ID)], [interaction.guild.get_role(STAFF_LEAD_ROLE_ID)])
+        # FIX: Put both roles inside the SAME list [role1, role2]
+        await self._create_ticket(interaction, "Game", MACROS["bug_report_questions"], TICKET_CATEGORY_ID, [interaction.guild.get_role(STAFF_ROLE_ID), interaction.guild.get_role(STAFF_LEAD_ROLE_ID)])
 
     @discord.ui.button(label="File a Complaint", style=discord.ButtonStyle.danger, custom_id="btn_complaint", emoji="⚖️")
     async def complaint(self, interaction: discord.Interaction, button: Button): 
@@ -269,7 +272,6 @@ async def sync(ctx):
         await ctx.send(f"❌ Sync failed: {e}")
 
 # --- SLASH COMMAND ---
-# --- FIX: Added default_permissions to hide from non-admins ---
 @bot.tree.command(name="setup_tickets", description="Setup the ticket support panel")
 @discord.app_commands.default_permissions(administrator=True)
 async def setup_tickets(interaction: discord.Interaction):
@@ -293,4 +295,3 @@ if __name__ == "__main__":
         bot.run(BOT_TOKEN)
     else:
         print("CRITICAL: No DISCORD_TOKEN found!")
-
