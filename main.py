@@ -3,19 +3,21 @@ import random
 import datetime
 import io
 import asyncio
-import os # Added for environment variables
+import os
 from discord.ext import commands, tasks
 from discord.ui import Button, View
-from flask import Flask # Added for Koyeb
-from threading import Thread # Added for Koyeb
+from flask import Flask
+from threading import Thread
 
-# --- KOYEB WEB SERVER SETUP ---
+# --- KOYEB WEB SERVER SETUP (Required for 24/7 Hosting) ---
 app = Flask('')
+
 @app.route('/')
 def home():
-    return "Ticket Bot is Online!"
+    return "Ticket Bot is Online and Healthy!"
 
 def run_web_server():
+    # Koyeb uses port 8080 by default
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
@@ -24,10 +26,8 @@ def keep_alive():
     t.daemon = True
     t.start()
 
-# --- Configuration ---
-# DO NOT paste your token here. Use the Environment Variable "DISCORD_TOKEN" in Koyeb.
+# --- CONFIGURATION ---
 BOT_TOKEN = os.getenv("DISCORD_TOKEN") 
-
 GUILD_ID = 1428466555850719347  
 TICKET_CATEGORY_ID = 1428466916166598818 
 STAFF_ROLE_ID = 1428466660012200036     
@@ -43,7 +43,7 @@ INACTIVITY_WARN_AFTER_HOURS = 24
 INACTIVITY_CLOSE_AFTER_HOURS = 48
 CHECK_INTERVAL_MINUTES = 5
 
-# --- Canned Responses ---
+# --- CANNED RESPONSES ---
 MACROS = { 
     "welcome": "Hello! How can I assist you today?", 
     "bug_report_questions": "1. What is the bug?\n2. Where does it happen?\n3. Steps to reproduce?", 
@@ -51,15 +51,26 @@ MACROS = {
     "closing": "Is there anything else I can help with before closing?" 
 }
 
-bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
+# --- BOT INITIALIZATION ---
+class MyBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.all()
+        super().__init__(command_prefix="!", intents=intents)
 
-# --- Helper Functions ---
+    async def setup_hook(self):
+        # Register persistent views so buttons work after bot restarts
+        self.add_view(TicketControlPanelView())
+        self.add_view(TicketActionView())
+
+bot = MyBot()
+
+# --- HELPER FUNCTIONS ---
 def is_staff_or_supervisor(interaction: discord.Interaction) -> bool:
     staff_role = interaction.guild.get_role(STAFF_ROLE_ID)
     supervisor_role = interaction.guild.get_role(SUPERVISOR_ROLE_ID)
     return (staff_role and staff_role in interaction.user.roles) or (supervisor_role and supervisor_role in interaction.user.roles)
 
-# --- Logging & Closing ---
+# --- LOGGING & CLOSING ---
 async def close_and_log_ticket(interaction_or_channel, closer_member, reason="Ticket Closed"):
     channel = interaction_or_channel if isinstance(interaction_or_channel, discord.TextChannel) else interaction_or_channel.channel
     guild = channel.guild
@@ -102,7 +113,7 @@ async def close_and_log_ticket(interaction_or_channel, closer_member, reason="Ti
     await asyncio.sleep(5)
     await channel.delete()
 
-# --- Views ---
+# --- VIEWS ---
 class FeedbackRatingView(View):
     def __init__(self, ticket_id: str, closer_member: discord.Member):
         super().__init__(timeout=None)
@@ -134,21 +145,24 @@ class FeedbackRatingView(View):
 class TicketActionView(View):
     def __init__(self, show_claim: bool = True):
         super().__init__(timeout=None)
-        if not show_claim: self.remove_item(self.claim_ticket_button)
+        if not show_claim: 
+            for item in self.children:
+                if item.custom_id == "claim_ticket":
+                    self.remove_item(item)
 
     @discord.ui.button(label="Claim", style=discord.ButtonStyle.success, custom_id="claim_ticket", emoji="🙋")
-    async def claim_ticket_button(self, button: Button, interaction: discord.Interaction):
+    async def claim_ticket_button(self, interaction: discord.Interaction, button: Button):
         if not is_staff_or_supervisor(interaction): 
-            return await interaction.response.send_message("Only staff can claim tickets.", ephemeral=True, delete_after=5)
+            return await interaction.response.send_message("Only staff can claim tickets.", ephemeral=True)
         button.disabled = True
         button.label = f"Claimed by {interaction.user.display_name}"
         await interaction.message.edit(view=self)
         await interaction.response.send_message(f"Ticket claimed by {interaction.user.mention}")
 
     @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="close_ticket", emoji="🔒")
-    async def close_ticket_button(self, button: Button, interaction: discord.Interaction):
+    async def close_ticket_button(self, interaction: discord.Interaction, button: Button):
         if not is_staff_or_supervisor(interaction): 
-            return await interaction.response.send_message("Permission denied.", ephemeral=True, delete_after=5)
+            return await interaction.response.send_message("Permission denied.", ephemeral=True)
         await interaction.response.send_message("Closing ticket...")
         await close_and_log_ticket(interaction, interaction.user)
 
@@ -162,7 +176,7 @@ class TicketControlPanelView(View):
         
         for channel in category.text_channels:
             if channel.topic and str(interaction.user.id) in channel.topic:
-                return await interaction.followup.send(f"You already have a ticket here: {channel.mention}", ephemeral=True, delete_after=10)
+                return await interaction.followup.send(f"You already have a ticket here: {channel.mention}", ephemeral=True)
 
         ticket_id = f"{ticket_type[:3].upper()}-{random.randint(1000, 9999)}-{random.randint(100, 999)}"
         overwrites = {
@@ -181,22 +195,21 @@ class TicketControlPanelView(View):
 
         embed = discord.Embed(title=f"{ticket_type} Support Request", description=f"Hello {interaction.user.mention}!\n\n**Please provide details:**\n{questions}", color=discord.Color.blue())
         await channel.send(embed=embed, view=TicketActionView(show_claim=(ticket_type != "Complaint")))
-        
-        await interaction.followup.send(f"Ticket created: {channel.mention}", ephemeral=True, delete_after=10)
+        await interaction.followup.send(f"Ticket created: {channel.mention}", ephemeral=True)
 
     @discord.ui.button(label="Server Support", style=discord.ButtonStyle.primary, custom_id="btn_server", emoji="🖥️")
-    async def server_support(self, b, i): 
-        await self._create_ticket(i, "Server", MACROS["server_issue_questions"], TICKET_CATEGORY_ID, [i.guild.get_role(STAFF_ROLE_ID)])
+    async def server_support(self, interaction: discord.Interaction, button: Button): 
+        await self._create_ticket(interaction, "Server", MACROS["server_issue_questions"], TICKET_CATEGORY_ID, [interaction.guild.get_role(STAFF_ROLE_ID)])
 
     @discord.ui.button(label="Game Support", style=discord.ButtonStyle.success, custom_id="btn_game", emoji="🎮")
-    async def game_support(self, b, i): 
-        await self._create_ticket(i, "Game", MACROS["bug_report_questions"], TICKET_CATEGORY_ID, [i.guild.get_role(STAFF_ROLE_ID)])
+    async def game_support(self, interaction: discord.Interaction, button: Button): 
+        await self._create_ticket(interaction, "Game", MACROS["bug_report_questions"], TICKET_CATEGORY_ID, [interaction.guild.get_role(STAFF_ROLE_ID)])
 
     @discord.ui.button(label="File a Complaint", style=discord.ButtonStyle.danger, custom_id="btn_complaint", emoji="⚖️")
-    async def complaint(self, b, i): 
-        await self._create_ticket(i, "Complaint", "Describe your complaint in detail.", COMPLAINT_CATEGORY_ID, [i.guild.get_role(SUPERVISOR_ROLE_ID)])
+    async def complaint(self, interaction: discord.Interaction, button: Button): 
+        await self._create_ticket(interaction, "Complaint", "Describe your complaint in detail.", COMPLAINT_CATEGORY_ID, [interaction.guild.get_role(SUPERVISOR_ROLE_ID)])
 
-# --- Tasks & Events ---
+# --- TASKS & EVENTS ---
 @tasks.loop(minutes=CHECK_INTERVAL_MINUTES)
 async def check_inactive_tickets():
     await bot.wait_until_ready()
@@ -222,14 +235,23 @@ async def check_inactive_tickets():
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user.name}")
-    bot.add_view(TicketControlPanelView())
-    bot.add_view(TicketActionView())
+    
+    # --- SYNC SLASH COMMANDS ---
+    try:
+        guild = discord.Object(id=GUILD_ID)
+        bot.tree.copy_global_to(guild=guild)
+        await bot.tree.sync(guild=guild)
+        print(f"Synced slash commands to guild {GUILD_ID}")
+    except Exception as e:
+        print(f"Error syncing commands: {e}")
+
     if not check_inactive_tickets.is_running():
         check_inactive_tickets.start()
 
-@bot.slash_command(name="setup_tickets", guild_ids=[GUILD_ID])
+# --- SLASH COMMANDS ---
+@bot.tree.command(name="setup_tickets", description="Setup the ticket support panel")
 @commands.has_permissions(administrator=True)
-async def setup_tickets(ctx):
+async def setup_tickets(interaction: discord.Interaction):
     embed = discord.Embed(
         title="Support Center", 
         description=(
@@ -241,13 +263,12 @@ async def setup_tickets(ctx):
         ), 
         color=discord.Color.blue()
     )
-    await ctx.send(embed=embed, view=TicketControlPanelView())
-    await ctx.respond("Panel Created!", ephemeral=True, delete_after=5)
+    await interaction.response.send_message(embed=embed, view=TicketControlPanelView())
 
-# --- START BOT ---
+# --- MAIN EXECUTION ---
 if __name__ == "__main__":
-    keep_alive() # Starts Flask on Port 8080
+    keep_alive()  # Starts the Flask web server
     if BOT_TOKEN:
         bot.run(BOT_TOKEN)
     else:
-        print("FATAL ERROR: DISCORD_TOKEN environment variable not found.")
+        print("No DISCORD_TOKEN found in environment variables!")
