@@ -84,10 +84,9 @@ class MyBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        # Adding views to setup_hook makes them persistent
         self.add_view(TicketControlPanelView())
         self.add_view(TicketActionView())
-        self.add_view(FeedbackRatingView(None, None)) # Template for persistence
+        self.add_view(FeedbackRatingView()) 
 
 bot = MyBot()
 
@@ -96,13 +95,14 @@ def is_staff_or_supervisor(interaction: discord.Interaction) -> bool:
     staff_lead_role = interaction.guild.get_role(STAFF_LEAD_ROLE_ID)
     supervisor_role = interaction.guild.get_role(SUPERVISOR_ROLE_ID)
     user_roles = interaction.user.roles
-    return (staff_role in user_roles) or (staff_lead_role in user_roles) or (supervisor_role in user_roles)
+    return any(role in user_roles for role in [staff_role, staff_lead_role, supervisor_role])
 
 # --- MODALS ---
 class CloseTicketModal(Modal, title="Close Ticket"):
     reason = TextInput(label="Reason for Closing", placeholder="Provide a reason for the user...", style=discord.TextStyle.paragraph, required=True)
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Respond immediately to prevent timeout
         await interaction.response.send_message("Processing ticket closure...", ephemeral=True)
         await close_and_log_ticket(interaction.channel, interaction.user, reason=self.reason.value)
 
@@ -130,7 +130,8 @@ async def close_and_log_ticket(channel, closer_member, reason="No reason provide
                 owner_member = await guild.fetch_member(owner_id)
             except: pass
 
-    log_embed = discord.Embed(title="Ticket Closed", color=discord.Color.orange(), timestamp=datetime.datetime.utcnow())
+    # Fixed DeprecationWarning here
+    log_embed = discord.Embed(title="Ticket Closed", color=discord.Color.orange(), timestamp=discord.utils.utcnow())
     log_embed.add_field(name="Ticket ID", value=f"`{ticket_id}`", inline=True)
     log_embed.add_field(name="Opened By", value=owner_member.mention if owner_member else "Unknown", inline=True)
     log_embed.add_field(name="Closed By", value=closer_member.mention, inline=True)
@@ -142,7 +143,7 @@ async def close_and_log_ticket(channel, closer_member, reason="No reason provide
     if owner_member and channel.category_id != COMPLAINT_CATEGORY_ID:
         try: 
             dm_embed = discord.Embed(title="Ticket Closed", description=f"Your ticket (`{ticket_id}`) has been closed.\n**Reason:** {reason}", color=discord.Color.red())
-            await owner_member.send(embed=dm_embed, view=FeedbackRatingView(ticket_id, closer_member))
+            await owner_member.send(embed=dm_embed, view=FeedbackRatingView(ticket_id, closer_member.mention))
         except: pass
 
     await channel.send(f"**Closing Reason:** {reason}\nThis channel will be deleted in 5 seconds.")
@@ -151,17 +152,13 @@ async def close_and_log_ticket(channel, closer_member, reason="No reason provide
 
 # --- VIEWS ---
 class FeedbackRatingView(View):
-    def __init__(self, ticket_id=None, closer_member=None):
-        # Using fixed custom_ids makes the buttons persistent
+    def __init__(self, ticket_id="Unknown", closer_mention="Staff"):
         super().__init__(timeout=None)
         self.ticket_id = ticket_id
-        self.closer_member = closer_member
+        self.closer_mention = closer_mention
 
     async def _process_rating(self, i: discord.Interaction, rating: int):
-        # For persistent views, we often extract data from the embed if not in memory
-        ticket_id = self.ticket_id or "Unknown"
-        closer_mention = self.closer_member.mention if self.closer_member else "Staff"
-
+        # Acknowledge the interaction immediately
         for item in self.children: item.disabled = True
         await i.response.edit_message(content=f"Thank you! You rated this **{rating}/5 stars**.", view=self)
         
@@ -169,8 +166,8 @@ class FeedbackRatingView(View):
         if feedback_channel:
             embed = discord.Embed(title="New Support Feedback", color=discord.Color.gold())
             embed.add_field(name="Rating", value=f"{'⭐' * rating} ({rating}/5)")
-            embed.add_field(name="Ticket ID", value=f"`{ticket_id}`")
-            embed.add_field(name="Handled By", value=closer_mention)
+            embed.add_field(name="Ticket ID", value=f"`{self.ticket_id}`")
+            embed.add_field(name="Handled By", value=self.closer_mention)
             embed.add_field(name="Submitter", value=i.user.mention)
             await feedback_channel.send(embed=embed)
 
@@ -198,39 +195,41 @@ class TicketActionView(View):
         if not is_staff_or_supervisor(interaction): 
             return await interaction.response.send_message("Only staff can claim tickets.", ephemeral=True)
         
+        # 1. Update the button immediately to acknowledge interaction
         button.disabled = True
         button.label = f"Claimed by {interaction.user.display_name}"
+        await interaction.response.edit_message(view=self)
         
-        # PERMISSION LOGIC: Lock out other staff
+        # 2. Perform permission logic
         guild = interaction.guild
         staff_role = guild.get_role(STAFF_ROLE_ID)
         staff_lead_role = guild.get_role(STAFF_LEAD_ROLE_ID)
         supervisor_role = guild.get_role(SUPERVISOR_ROLE_ID)
         
-        # Staff can no longer send messages, but can still view
         await interaction.channel.set_permissions(staff_role, send_messages=False, read_messages=True)
-        # Explicitly allow the person who claimed it
         await interaction.channel.set_permissions(interaction.user, send_messages=True, read_messages=True, attach_files=True)
-        # Ensure Leadership can still talk
+        
         if staff_lead_role: await interaction.channel.set_permissions(staff_lead_role, send_messages=True, read_messages=True)
         if supervisor_role: await interaction.channel.set_permissions(supervisor_role, send_messages=True, read_messages=True)
 
-        await interaction.message.edit(view=self)
-        await interaction.response.send_message(f"Ticket claimed by {interaction.user.mention}. Other staff can now only view this channel.")
+        # 3. Use followup because the interaction was already responded to via edit_message
+        await interaction.followup.send(f"Ticket claimed by {interaction.user.mention}. Other staff can now only view this channel.")
 
     @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="close_ticket", emoji="🔒")
     async def close_ticket_button(self, interaction: discord.Interaction, button: Button):
         if not is_staff_or_supervisor(interaction): 
             return await interaction.response.send_message("Permission denied.", ephemeral=True)
         
-        # Trigger Modal for reason
+        # Send modal directly (do not defer)
         await interaction.response.send_modal(CloseTicketModal())
 
 class TicketControlPanelView(View):
     def __init__(self): super().__init__(timeout=None)
 
     async def _create_ticket(self, interaction, ticket_type, questions, category_id, roles_to_add):
+        # Acknowledge immediately!
         await interaction.response.defer(ephemeral=True)
+        
         guild = interaction.guild
         category = guild.get_channel(category_id)
         
@@ -256,10 +255,8 @@ class TicketControlPanelView(View):
         embed = discord.Embed(title=f"{ticket_type} Support Request", description=f"Hello {interaction.user.mention}!\n\n{questions}", color=discord.Color.blue())
         await channel.send(embed=embed, view=TicketActionView(show_claim=(ticket_type != "Complaint")))
         
-        msg = await interaction.followup.send(f"Ticket created: {channel.mention}", ephemeral=True)
-        await asyncio.sleep(10)
-        try: await msg.delete()
-        except: pass
+        # Use followup because we deferred
+        await interaction.followup.send(f"Ticket created: {channel.mention}", ephemeral=True)
 
     @discord.ui.button(label="Server Support", style=discord.ButtonStyle.primary, custom_id="btn_server", emoji="🖥️")
     async def server_support(self, interaction: discord.Interaction, button: Button): 
@@ -302,7 +299,6 @@ async def check_inactive_tickets():
 async def on_ready():
     print(f"--- BOT IS ONLINE AS {bot.user.name} ---")
     
-    # Syncing commands
     try:
         guild = discord.Object(id=GUILD_ID)
         bot.tree.copy_global_to(guild=guild)
@@ -313,17 +309,6 @@ async def on_ready():
 
     if not check_inactive_tickets.is_running():
         check_inactive_tickets.start()
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def sync(ctx):
-    try:
-        guild = discord.Object(id=GUILD_ID)
-        bot.tree.copy_global_to(guild=guild)
-        await bot.tree.sync(guild=guild)
-        await ctx.send(f"✅ Commands synced!")
-    except Exception as e:
-        await ctx.send(f"❌ Sync failed: {e}")
 
 @bot.tree.command(name="setup_tickets", description="Setup the ticket support panel")
 @discord.app_commands.default_permissions(administrator=True)
