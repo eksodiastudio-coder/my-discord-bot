@@ -153,34 +153,51 @@ async def close_and_log_ticket(channel, closer_member, reason="No reason provide
 # --- VIEWS ---
 class FeedbackRatingView(View):
     def __init__(self, ticket_id="Unknown", closer_mention="Staff"):
+        # timeout=None makes the view persistent
         super().__init__(timeout=None)
         self.ticket_id = ticket_id
         self.closer_mention = closer_mention
 
-    async def _process_rating(self, i: discord.Interaction, rating: int):
-        # Acknowledge the interaction immediately
-        for item in self.children: item.disabled = True
-        await i.response.edit_message(content=f"Thank you! You rated this **{rating}/5 stars**.", view=self)
+    async def _process_rating(self, interaction: discord.Interaction, rating: int):
+        # 1. Acknowledge the interaction immediately
+        for item in self.children:
+            item.disabled = True
         
-        feedback_channel = i.client.get_channel(FEEDBACK_LOG_CHANNEL_ID)
+        await interaction.response.edit_message(
+            content=f"Thank you! You rated this **{rating}/5 stars**.", 
+            view=self
+        )
+        
+        # 2. Send to the feedback log channel
+        feedback_channel = interaction.client.get_channel(FEEDBACK_LOG_CHANNEL_ID)
         if feedback_channel:
             embed = discord.Embed(title="New Support Feedback", color=discord.Color.gold())
             embed.add_field(name="Rating", value=f"{'⭐' * rating} ({rating}/5)")
             embed.add_field(name="Ticket ID", value=f"`{self.ticket_id}`")
             embed.add_field(name="Handled By", value=self.closer_mention)
-            embed.add_field(name="Submitter", value=i.user.mention)
+            embed.add_field(name="Submitter", value=interaction.user.mention)
             await feedback_channel.send(embed=embed)
 
+    # Note the argument order: (self, interaction, button)
     @discord.ui.button(label="1", style=discord.ButtonStyle.danger, custom_id="rate_1")
-    async def r1(self, b, i): await self._process_rating(i, 1)
+    async def r1(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._process_rating(interaction, 1)
+
     @discord.ui.button(label="2", style=discord.ButtonStyle.danger, custom_id="rate_2")
-    async def r2(self, b, i): await self._process_rating(i, 2)
+    async def r2(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._process_rating(interaction, 2)
+
     @discord.ui.button(label="3", style=discord.ButtonStyle.secondary, custom_id="rate_3")
-    async def r3(self, b, i): await self._process_rating(i, 3)
+    async def r3(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._process_rating(interaction, 3)
+
     @discord.ui.button(label="4", style=discord.ButtonStyle.success, custom_id="rate_4")
-    async def r4(self, b, i): await self._process_rating(i, 4)
+    async def r4(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._process_rating(interaction, 4)
+
     @discord.ui.button(label="5", style=discord.ButtonStyle.success, custom_id="rate_5")
-    async def r5(self, b, i): await self._process_rating(i, 5)
+    async def r5(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._process_rating(interaction, 5)
 
 class TicketActionView(View):
     def __init__(self, show_claim: bool = True):
@@ -333,3 +350,4 @@ if __name__ == "__main__":
         bot.run(BOT_TOKEN)
     else:
         print("CRITICAL: No DISCORD_TOKEN found!")
+
