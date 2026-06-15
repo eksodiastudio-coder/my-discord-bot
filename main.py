@@ -4,10 +4,12 @@ import datetime
 import io
 import asyncio
 import os
+import aiohttp
 from discord.ext import commands, tasks
 from discord.ui import Button, View, Modal, TextInput
 from flask import Flask
 from threading import Thread
+from discord import app_commands
 
 # --- KOYEB WEB SERVER SETUP ---
 app = Flask('')
@@ -77,18 +79,7 @@ MACROS = {
     "closing": "Is there anything else I can help with before closing?" 
 }
 
-# --- BOT SETUP ---
-class MyBot(commands.Bot):
-    def __init__(self):
-        intents = discord.Intents.all()
-        super().__init__(command_prefix="!", intents=intents)
-
-    async def setup_hook(self):
-        self.add_view(TicketControlPanelView())
-        self.add_view(TicketActionView())
-        self.add_view(FeedbackRatingView("Unknown", "Staff")) # Defaults 
-
-bot = MyBot()
+# --- HELPERS ---
 
 def is_staff_or_supervisor(interaction: discord.Interaction) -> bool:
     staff_role = interaction.guild.get_role(STAFF_ROLE_ID)
@@ -97,12 +88,49 @@ def is_staff_or_supervisor(interaction: discord.Interaction) -> bool:
     user_roles = interaction.user.roles
     return any(role in user_roles for role in [staff_role, staff_lead_role, supervisor_role])
 
+async def create_ticket_logic(guild, member, ticket_type, questions, category_id, roles_to_add, interaction: discord.Interaction):
+    """Refactored logic to handle ticket creation for both buttons and commands."""
+    category = guild.get_channel(category_id)
+    if not category:
+        return await interaction.followup.send("Error: Ticket category not found.", ephemeral=True)
+
+    # Check for existing tickets
+    for channel in category.text_channels:
+        if channel.topic and str(member.id) in channel.topic:
+            return await interaction.followup.send(f"{member.display_name} already has a ticket open here: {channel.mention}", ephemeral=True)
+
+    ticket_id = f"{ticket_type[:3].upper()}-{random.randint(1000, 9999)}-{random.randint(100, 999)}"
+    
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(read_messages=False),
+        member: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True),
+        guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
+    }
+    
+    for role_id in roles_to_add:
+        role = guild.get_role(role_id)
+        if role:
+            overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+
+    channel = await category.create_text_channel(
+        name=f"{ticket_type}-{member.name}",
+        overwrites=overwrites,
+        topic=f"Ticket for {member.id} | ID: {ticket_id}"
+    )
+
+    embed = discord.Embed(title=f"{ticket_type} Support Request", description=f"Hello {member.mention}!\n\n{questions}", color=discord.Color.blue())
+    if interaction.user != member:
+        embed.set_footer(text=f"Ticket opened by staff: {interaction.user.display_name}")
+
+    await channel.send(embed=embed, view=TicketActionView(show_claim=(ticket_type != "Complaint")))
+    await interaction.followup.send(f"Ticket created: {channel.mention}", ephemeral=True)
+    return channel
+
 # --- MODALS ---
 class CloseTicketModal(Modal, title="Close Ticket"):
     reason = TextInput(label="Reason for Closing", placeholder="Provide a reason for the user...", style=discord.TextStyle.paragraph, required=True)
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Respond immediately to prevent timeout
         await interaction.response.send_message("Processing ticket closure...", ephemeral=True)
         await close_and_log_ticket(interaction.channel, interaction.user, reason=self.reason.value)
 
@@ -130,7 +158,6 @@ async def close_and_log_ticket(channel, closer_member, reason="No reason provide
                 owner_member = await guild.fetch_member(owner_id)
             except: pass
 
-    # Fixed DeprecationWarning here
     log_embed = discord.Embed(title="Ticket Closed", color=discord.Color.orange(), timestamp=discord.utils.utcnow())
     log_embed.add_field(name="Ticket ID", value=f"`{ticket_id}`", inline=True)
     log_embed.add_field(name="Opened By", value=owner_member.mention if owner_member else "Unknown", inline=True)
@@ -153,20 +180,14 @@ async def close_and_log_ticket(channel, closer_member, reason="No reason provide
 # --- VIEWS ---
 class FeedbackRatingView(View):
     def __init__(self, ticket_id="Unknown", closer_mention="Staff"):
-        # timeout=None is required for persistent views (added in setup_hook)
         super().__init__(timeout=None)
         self.ticket_id = ticket_id
         self.closer_mention = closer_mention
 
     async def _process_rating(self, interaction: discord.Interaction, rating: int):
-        # Disable all buttons so they can't vote twice
-        for item in self.children:
-            item.disabled = True
-        
-        # Acknowledge the interaction
+        for item in self.children: item.disabled = True
         await interaction.response.edit_message(content=f"Thank you! You rated this **{rating}/5 stars**.", view=self)
         
-        # Send the log
         feedback_channel = interaction.client.get_channel(FEEDBACK_LOG_CHANNEL_ID)
         if feedback_channel:
             embed = discord.Embed(title="New Support Feedback", color=discord.Color.gold())
@@ -176,135 +197,149 @@ class FeedbackRatingView(View):
             embed.add_field(name="Submitter", value=interaction.user.mention)
             await feedback_channel.send(embed=embed)
 
-    # Arguments MUST be (self, interaction, button)
     @discord.ui.button(label="1", style=discord.ButtonStyle.danger, custom_id="rate_1")
-    async def r1(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._process_rating(interaction, 1)
-
+    async def r1(self, interaction: discord.Interaction, button: Button): await self._process_rating(interaction, 1)
     @discord.ui.button(label="2", style=discord.ButtonStyle.danger, custom_id="rate_2")
-    async def r2(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._process_rating(interaction, 2)
-
+    async def r2(self, interaction: discord.Interaction, button: Button): await self._process_rating(interaction, 2)
     @discord.ui.button(label="3", style=discord.ButtonStyle.secondary, custom_id="rate_3")
-    async def r3(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._process_rating(interaction, 3)
-
+    async def r3(self, interaction: discord.Interaction, button: Button): await self._process_rating(interaction, 3)
     @discord.ui.button(label="4", style=discord.ButtonStyle.success, custom_id="rate_4")
-    async def r4(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._process_rating(interaction, 4)
-
+    async def r4(self, interaction: discord.Interaction, button: Button): await self._process_rating(interaction, 4)
     @discord.ui.button(label="5", style=discord.ButtonStyle.success, custom_id="rate_5")
-    async def r5(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._process_rating(interaction, 5)
-
-    # Note the argument order: (self, interaction, button)
-    @discord.ui.button(label="1", style=discord.ButtonStyle.danger, custom_id="rate_1")
-    async def r1(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._process_rating(interaction, 1)
-
-    @discord.ui.button(label="2", style=discord.ButtonStyle.danger, custom_id="rate_2")
-    async def r2(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._process_rating(interaction, 2)
-
-    @discord.ui.button(label="3", style=discord.ButtonStyle.secondary, custom_id="rate_3")
-    async def r3(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._process_rating(interaction, 3)
-
-    @discord.ui.button(label="4", style=discord.ButtonStyle.success, custom_id="rate_4")
-    async def r4(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._process_rating(interaction, 4)
-
-    @discord.ui.button(label="5", style=discord.ButtonStyle.success, custom_id="rate_5")
-    async def r5(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._process_rating(interaction, 5)
+    async def r5(self, interaction: discord.Interaction, button: Button): await self._process_rating(interaction, 5)
 
 class TicketActionView(View):
     def __init__(self, show_claim: bool = True):
         super().__init__(timeout=None)
         if not show_claim:
             for item in self.children:
-                if item.custom_id == "claim_ticket":
-                    self.remove_item(item)
+                if item.custom_id == "claim_ticket": self.remove_item(item)
 
     @discord.ui.button(label="Claim", style=discord.ButtonStyle.success, custom_id="claim_ticket", emoji="🙋")
     async def claim_ticket_button(self, interaction: discord.Interaction, button: Button):
         if not is_staff_or_supervisor(interaction): 
             return await interaction.response.send_message("Only staff can claim tickets.", ephemeral=True)
         
-        # 1. Update the button immediately to acknowledge interaction
         button.disabled = True
         button.label = f"Claimed by {interaction.user.display_name}"
         await interaction.response.edit_message(view=self)
         
-        # 2. Perform permission logic
         guild = interaction.guild
         staff_role = guild.get_role(STAFF_ROLE_ID)
-        staff_lead_role = guild.get_role(STAFF_LEAD_ROLE_ID)
-        supervisor_role = guild.get_role(SUPERVISOR_ROLE_ID)
-        
         await interaction.channel.set_permissions(staff_role, send_messages=False, read_messages=True)
         await interaction.channel.set_permissions(interaction.user, send_messages=True, read_messages=True, attach_files=True)
         
-        if staff_lead_role: await interaction.channel.set_permissions(staff_lead_role, send_messages=True, read_messages=True)
-        if supervisor_role: await interaction.channel.set_permissions(supervisor_role, send_messages=True, read_messages=True)
-
-        # 3. Use followup because the interaction was already responded to via edit_message
-        await interaction.followup.send(f"Ticket claimed by {interaction.user.mention}. Other staff can now only view this channel.")
+        await interaction.followup.send(f"Ticket claimed by {interaction.user.mention}. Other staff can now only view.")
 
     @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="close_ticket", emoji="🔒")
     async def close_ticket_button(self, interaction: discord.Interaction, button: Button):
         if not is_staff_or_supervisor(interaction): 
             return await interaction.response.send_message("Permission denied.", ephemeral=True)
-        
-        # Send modal directly (do not defer)
         await interaction.response.send_modal(CloseTicketModal())
 
 class TicketControlPanelView(View):
     def __init__(self): super().__init__(timeout=None)
 
-    async def _create_ticket(self, interaction, ticket_type, questions, category_id, roles_to_add):
-        # Acknowledge immediately!
-        await interaction.response.defer(ephemeral=True)
-        
-        guild = interaction.guild
-        category = guild.get_channel(category_id)
-        
-        for channel in category.text_channels:
-            if channel.topic and str(interaction.user.id) in channel.topic:
-                return await interaction.followup.send(f"You already have a ticket here: {channel.mention}", ephemeral=True)
-
-        ticket_id = f"{ticket_type[:3].upper()}-{random.randint(1000, 9999)}-{random.randint(100, 999)}"
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(read_messages=False),
-            interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True),
-            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
-        }
-        for role in roles_to_add:
-            if role: overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
-
-        channel = await category.create_text_channel(
-            name=f"{ticket_type}-{interaction.user.name}",
-            overwrites=overwrites,
-            topic=f"Ticket for {interaction.user.id} | ID: {ticket_id}"
-        )
-
-        embed = discord.Embed(title=f"{ticket_type} Support Request", description=f"Hello {interaction.user.mention}!\n\n{questions}", color=discord.Color.blue())
-        await channel.send(embed=embed, view=TicketActionView(show_claim=(ticket_type != "Complaint")))
-        
-        # Use followup because we deferred
-        await interaction.followup.send(f"Ticket created: {channel.mention}", ephemeral=True)
-
     @discord.ui.button(label="Server Support", style=discord.ButtonStyle.primary, custom_id="btn_server", emoji="🖥️")
     async def server_support(self, interaction: discord.Interaction, button: Button): 
-        await self._create_ticket(interaction, "Server", MACROS["server_issue_questions"], TICKET_CATEGORY_ID, [interaction.guild.get_role(STAFF_ROLE_ID), interaction.guild.get_role(STAFF_LEAD_ROLE_ID)])
+        await interaction.response.defer(ephemeral=True)
+        await create_ticket_logic(interaction.guild, interaction.user, "Server", MACROS["server_issue_questions"], TICKET_CATEGORY_ID, [STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID], interaction)
 
     @discord.ui.button(label="Game Support", style=discord.ButtonStyle.success, custom_id="btn_game", emoji="🎮")
     async def game_support(self, interaction: discord.Interaction, button: Button): 
-        await self._create_ticket(interaction, "Game", MACROS["game_support_questions"], TICKET_CATEGORY_ID, [interaction.guild.get_role(STAFF_ROLE_ID), interaction.guild.get_role(STAFF_LEAD_ROLE_ID)])
+        await interaction.response.defer(ephemeral=True)
+        await create_ticket_logic(interaction.guild, interaction.user, "Game", MACROS["game_support_questions"], TICKET_CATEGORY_ID, [STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID], interaction)
 
     @discord.ui.button(label="File a Complaint", style=discord.ButtonStyle.danger, custom_id="btn_complaint", emoji="⚖️")
     async def complaint(self, interaction: discord.Interaction, button: Button): 
-        await self._create_ticket(interaction, "Complaint", "Describe your complaint in detail.", COMPLAINT_CATEGORY_ID, [interaction.guild.get_role(SUPERVISOR_ROLE_ID)])
+        await interaction.response.defer(ephemeral=True)
+        await create_ticket_logic(interaction.guild, interaction.user, "Complaint", "Describe your complaint in detail.", COMPLAINT_CATEGORY_ID, [SUPERVISOR_ROLE_ID], interaction)
+
+# --- BOT SETUP ---
+class MyBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.all()
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self):
+        self.add_view(TicketControlPanelView())
+        self.add_view(TicketActionView())
+        self.add_view(FeedbackRatingView())
+
+bot = MyBot()
+
+# --- COMMANDS ---
+
+@bot.tree.command(name="setup_tickets", description="Setup the ticket support panel")
+@app_commands.default_permissions(administrator=True)
+async def setup_tickets(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="Support Center", 
+        description=(
+            "Please select the appropriate category for your support request below.\n\n"
+            "🖥️ **Server Support**\nFor issues related to the server (mutes, warning, ban or reporting a member).\n\n"
+            "🎮 **Game Support**\nFor appealing ban, reporting glitch abusers/hackers, or issues related to the game.\n\n"
+            "⚖️ **File a Complaint**\n*Supervisor-Only:* Use this to file a formal complaint against a staff member."
+        ), 
+        color=discord.Color.blue()
+    )
+    await interaction.channel.send(embed=embed, view=TicketControlPanelView())
+    await interaction.response.send_message("✅ Ticket panel has been posted successfully!", ephemeral=True)
+
+@bot.tree.command(name="createticket", description="Create a ticket on behalf of a member")
+@app_commands.describe(ticket_type="Type of ticket", member="Member to open for")
+@app_commands.choices(ticket_type=[
+    app_commands.Choice(name="Server Support", value="Server"),
+    app_commands.Choice(name="Game Support", value="Game"),
+    app_commands.Choice(name="Complaint", value="Complaint")
+])
+async def createticket(interaction: discord.Interaction, ticket_type: app_commands.Choice[str], member: discord.Member):
+    if not is_staff_or_supervisor(interaction):
+        return await interaction.response.send_message("Permission denied.", ephemeral=True)
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    if ticket_type.value == "Complaint":
+        await create_ticket_logic(interaction.guild, member, "Complaint", "Staff-initiated complaint ticket.", COMPLAINT_CATEGORY_ID, [SUPERVISOR_ROLE_ID], interaction)
+    elif ticket_type.value == "Server":
+        await create_ticket_logic(interaction.guild, member, "Server", MACROS["server_issue_questions"], TICKET_CATEGORY_ID, [STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID], interaction)
+    else:
+        await create_ticket_logic(interaction.guild, member, "Game", MACROS["game_support_questions"], TICKET_CATEGORY_ID, [STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID], interaction)
+
+@bot.tree.command(name="merge", description="Merge this ticket's history into another ticket and close this one")
+@app_commands.describe(target_channel="The correct ticket channel to move messages to")
+async def merge(interaction: discord.Interaction, target_channel: discord.TextChannel):
+    if not is_staff_or_supervisor(interaction):
+        return await interaction.response.send_message("Permission denied.", ephemeral=True)
+
+    if interaction.channel.id == target_channel.id:
+        return await interaction.response.send_message("Cannot merge a channel into itself.", ephemeral=True)
+
+    await interaction.response.send_message(f"Merging content into {target_channel.mention}... This may take a moment.")
+    
+    # Use a session to download images
+    async with aiohttp.ClientSession() as session:
+        # Limit history to 100 messages to prevent infinite processing
+        async for message in interaction.channel.history(limit=100, oldest_first=True):
+            # Skip the initial welcome embed from the bot
+            if message.author == bot.user and message.embeds: continue
+            
+            content = f"**[Merged from {interaction.channel.name}]**\n**{message.author.display_name}:** {message.content}"
+            files = []
+            
+            for attachment in message.attachments:
+                async with session.get(attachment.url) as resp:
+                    if resp.status == 200:
+                        data = io.BytesIO(await resp.read())
+                        files.append(discord.File(data, filename=attachment.filename))
+            
+            if message.content.strip() or files:
+                await target_channel.send(content=content if message.content else f"**[Merged] {message.author.display_name}:**", files=files)
+                await asyncio.sleep(0.5) # Avoid rate limits
+
+    await interaction.channel.send("✅ Merge complete. Channel deleting...")
+    await asyncio.sleep(3)
+    await interaction.channel.delete()
 
 # --- TASKS & EVENTS ---
 @tasks.loop(minutes=CHECK_INTERVAL_MINUTES)
@@ -328,13 +363,12 @@ async def check_inactive_tickets():
                 await close_and_log_ticket(channel, bot.user, "Automated closing due to inactivity.")
             elif now - last_msg.created_at > warn_delta:
                 if not (last_msg.author == bot.user):
-                    await channel.send("⚠️ This ticket is inactive and will be closed automatically in 24 hours if no response is received.")
+                    await channel.send("⚠️ This ticket is inactive and will be closed automatically in 24 hours.")
         except: continue
 
 @bot.event
 async def on_ready():
     print(f"--- BOT IS ONLINE AS {bot.user.name} ---")
-    
     try:
         guild = discord.Object(id=GUILD_ID)
         bot.tree.copy_global_to(guild=guild)
@@ -342,26 +376,8 @@ async def on_ready():
         print(f"SUCCESS: Synced commands to guild {GUILD_ID}")
     except Exception as e:
         print(f"SYNC ERROR: {e}")
-
     if not check_inactive_tickets.is_running():
         check_inactive_tickets.start()
-
-@bot.tree.command(name="setup_tickets", description="Setup the ticket support panel")
-@discord.app_commands.default_permissions(administrator=True)
-async def setup_tickets(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="Support Center", 
-        description=(
-            "Please select the appropriate category for your support request below. "
-            "A private channel will be opened for you to speak with our team.\n\n"
-            "🖥️ **Server Support**\nFor issues related to the server (mutes, warning, ban or reporting a member).\n\n"
-            "🎮 **Game Support**\nFor appealing ban, reporting glitch abusers/hackers, or issues related to the game.\n\n"
-            "⚖️ **File a Complaint**\n*Supervisor-Only:* Use this to file a formal complaint against a staff member."
-        ), 
-        color=discord.Color.blue()
-    )
-    await interaction.channel.send(embed=embed, view=TicketControlPanelView())
-    await interaction.response.send_message("✅ Ticket panel has been posted successfully!", ephemeral=True)
 
 if __name__ == "__main__":
     keep_alive()
@@ -369,5 +385,3 @@ if __name__ == "__main__":
         bot.run(BOT_TOKEN)
     else:
         print("CRITICAL: No DISCORD_TOKEN found!")
-
-
