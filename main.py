@@ -86,12 +86,15 @@ MACROS = {
 
 # --- HELPERS ---
 
-def is_staff_or_supervisor(interaction: discord.Interaction) -> bool:
-    staff_role = interaction.guild.get_role(STAFF_ROLE_ID)
-    staff_lead_role = interaction.guild.get_role(STAFF_LEAD_ROLE_ID)
-    supervisor_role = interaction.guild.get_role(SUPERVISOR_ROLE_ID)
-    user_roles = interaction.user.roles
-    return any(role in user_roles for role in [staff_role, staff_lead_role, supervisor_role])
+def is_staff_or_higher(interaction: discord.Interaction) -> bool:
+    """Checks if user has Staff, Staff Lead, or Supervisor role."""
+    roles = [STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID]
+    return any(role.id in roles for role in interaction.user.roles)
+
+def is_lead_or_supervisor(interaction: discord.Interaction) -> bool:
+    """Checks if user has Staff Lead or Supervisor role."""
+    roles = [STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID]
+    return any(role.id in roles for role in interaction.user.roles)
 
 async def create_ticket_logic(guild, member, ticket_type, questions, category_id, roles_to_add, interaction: discord.Interaction):
     global AUTO_ASSIGN_ENABLED, ASSIGNMENT_INDEX
@@ -121,7 +124,7 @@ async def create_ticket_logic(guild, member, ticket_type, questions, category_id
             overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=can_send)
 
     assigned_trial = None
-    # Round-Robin Logic with Inactivity Check
+    # Round-Robin Logic with Inactivity check
     if AUTO_ASSIGN_ENABLED and ticket_type != "Complaint":
         trial_role = guild.get_role(TRIAL_MOD_ROLE_ID)
         inactive_role = guild.get_role(INACTIVE_ROLE_ID)
@@ -132,7 +135,6 @@ async def create_ticket_logic(guild, member, ticket_type, questions, category_id
                 m for m in trial_role.members 
                 if not m.bot and (not inactive_role or inactive_role not in m.roles)
             ]
-            
             # Sort by ID for consistent rotation
             available_trials.sort(key=lambda x: x.id)
             
@@ -149,11 +151,10 @@ async def create_ticket_logic(guild, member, ticket_type, questions, category_id
     )
 
     embed = discord.Embed(title=f"{ticket_type} Support Request", description=f"Hello {member.mention}!\n\n{questions}", color=discord.Color.blue())
-    
     view = TicketActionView(show_claim=(ticket_type != "Complaint"))
     
     if assigned_trial:
-        embed.add_field(name="Assigned Trial Moderator", value=f"{assigned_trial.mention}\n*Next in rotation.*")
+        embed.add_field(name="Assigned Trial Moderator", value=f"{assigned_trial.mention}\n*Assigned via round-robin.*")
         for item in view.children:
             if isinstance(item, Button) and item.custom_id == "claim_ticket":
                 item.disabled = True
@@ -163,7 +164,6 @@ async def create_ticket_logic(guild, member, ticket_type, questions, category_id
         embed.set_footer(text=f"Ticket opened by staff: {interaction.user.display_name}")
 
     await channel.send(embed=embed, view=view)
-    
     if assigned_trial:
         await channel.send(f"{assigned_trial.mention}, you have been automatically assigned to this ticket.")
 
@@ -194,8 +194,7 @@ async def close_and_log_ticket(channel, closer_member, reason="No reason provide
     ticket_id = "N/A"
     owner_member = None
     if channel.topic:
-        if "| ID: " in channel.topic: 
-            ticket_id = channel.topic.split("| ID: ")[1].strip()
+        if "| ID: " in channel.topic: ticket_id = channel.topic.split("| ID: ")[1].strip()
         if "Ticket for " in channel.topic:
             try: 
                 owner_id = int(channel.topic.split("for ")[1].split(" |")[0].strip())
@@ -261,15 +260,14 @@ class TicketActionView(View):
 
     @discord.ui.button(label="Claim", style=discord.ButtonStyle.success, custom_id="claim_ticket", emoji="🙋")
     async def claim_ticket_button(self, interaction: discord.Interaction, button: Button):
-        if not is_staff_or_supervisor(interaction): 
+        if not is_staff_or_higher(interaction): 
             return await interaction.response.send_message("Only staff can claim tickets.", ephemeral=True)
         
         button.disabled = True
         button.label = f"Claimed by {interaction.user.display_name}"
         await interaction.response.edit_message(view=self)
         
-        guild = interaction.guild
-        staff_role = guild.get_role(STAFF_ROLE_ID)
+        staff_role = interaction.guild.get_role(STAFF_ROLE_ID)
         await interaction.channel.set_permissions(staff_role, send_messages=False, read_messages=True)
         await interaction.channel.set_permissions(interaction.user, send_messages=True, read_messages=True, attach_files=True)
         
@@ -277,7 +275,7 @@ class TicketActionView(View):
 
     @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="close_ticket", emoji="🔒")
     async def close_ticket_button(self, interaction: discord.Interaction, button: Button):
-        if not is_staff_or_supervisor(interaction): 
+        if not is_staff_or_higher(interaction): 
             return await interaction.response.send_message("Permission denied.", ephemeral=True)
         await interaction.response.send_modal(CloseTicketModal())
 
@@ -315,85 +313,74 @@ bot = MyBot()
 # --- COMMANDS ---
 
 @bot.tree.command(name="assignon", description="Enable round-robin auto-assignment for Trial Moderators")
-@app_commands.default_permissions(administrator=True)
 async def assignon(interaction: discord.Interaction):
+    if not is_lead_or_supervisor(interaction):
+        return await interaction.response.send_message("Permission denied. Lead/Supervisor only.", ephemeral=True)
     global AUTO_ASSIGN_ENABLED
     AUTO_ASSIGN_ENABLED = True
-    await interaction.response.send_message("✅ **Ticket Auto-Assignment is now ON.**\n- Tickets will rotate through Active Trial Moderators.\n- Staff Role is View-Only until disabled.", ephemeral=False)
+    await interaction.response.send_message("✅ **Ticket Auto-Assignment is now ON.**", ephemeral=False)
 
 @bot.tree.command(name="assignoff", description="Disable auto-assignment for Trial Moderators")
-@app_commands.default_permissions(administrator=True)
 async def assignoff(interaction: discord.Interaction):
+    if not is_lead_or_supervisor(interaction):
+        return await interaction.response.send_message("Permission denied. Lead/Supervisor only.", ephemeral=True)
     global AUTO_ASSIGN_ENABLED
     AUTO_ASSIGN_ENABLED = False
-    await interaction.response.send_message("❌ **Ticket Auto-Assignment is now OFF.**\n- Manual claiming is restored for all staff.", ephemeral=False)
+    await interaction.response.send_message("❌ **Ticket Auto-Assignment is now OFF.**", ephemeral=False)
+
+@bot.tree.command(name="removeassign", description="Unlock the ticket so any staff can claim it")
+async def removeassign(interaction: discord.Interaction):
+    if not is_lead_or_supervisor(interaction):
+        return await interaction.response.send_message("Permission denied. Lead/Supervisor only.", ephemeral=True)
+    
+    if not interaction.channel.topic or "Ticket for" not in interaction.channel.topic:
+        return await interaction.response.send_message("This can only be used in ticket channels.", ephemeral=True)
+
+    await interaction.response.defer()
+    guild = interaction.guild
+    staff_role = guild.get_role(STAFF_ROLE_ID)
+    lead_role = guild.get_role(STAFF_LEAD_ROLE_ID)
+
+    # Restore Send Permissions for standard staff roles
+    if staff_role: await interaction.channel.set_permissions(staff_role, send_messages=True, read_messages=True, attach_files=True)
+    if lead_role: await interaction.channel.set_permissions(lead_role, send_messages=True, read_messages=True, attach_files=True)
+
+    # Remove the specific trial moderator's overwrite to reset the channel
+    for target, overwrite in interaction.channel.overwrites.items():
+        if isinstance(target, discord.Member) and not target.bot:
+            # Clear them ONLY if they aren't the ticket owner
+            if str(target.id) not in interaction.channel.topic:
+                await interaction.channel.set_permissions(target, overwrite=None)
+
+    await interaction.followup.send("🔓 **Ticket Assignment Removed.** Standard staff roles can now speak and claim this ticket manually.", view=TicketActionView(show_claim=True))
 
 @bot.tree.command(name="setup_tickets", description="Setup the ticket support panel")
 @app_commands.default_permissions(administrator=True)
 async def setup_tickets(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="Support Center", 
-        description=(
-            "Please select the appropriate category for your support request below.\n\n"
-            "🖥️ **Server Support**\nFor issues related to the server (mutes, warning, ban or reporting a member).\n\n"
-            "🎮 **Game Support**\nFor appealing ban, reporting glitch abusers/hackers, or issues related to the game.\n\n"
-            "⚖️ **File a Complaint**\n*Supervisor-Only:* Use this to file a formal complaint against a staff member."
-        ), 
-        color=discord.Color.blue()
-    )
+    embed = discord.Embed(title="Support Center", description="Select a category below to open a ticket.", color=discord.Color.blue())
     await interaction.channel.send(embed=embed, view=TicketControlPanelView())
-    await interaction.response.send_message("✅ Ticket panel has been posted successfully!", ephemeral=True)
+    await interaction.response.send_message("✅ Panel posted!", ephemeral=True)
 
 @bot.tree.command(name="createticket", description="Create a ticket on behalf of a member")
-@app_commands.describe(ticket_type="Type of ticket", member="Member to open for")
-@app_commands.choices(ticket_type=[
-    app_commands.Choice(name="Server Support", value="Server"),
-    app_commands.Choice(name="Game Support", value="Game"),
-    app_commands.Choice(name="Complaint", value="Complaint")
-])
 async def createticket(interaction: discord.Interaction, ticket_type: app_commands.Choice[str], member: discord.Member):
-    if not is_staff_or_supervisor(interaction):
+    if not is_staff_or_higher(interaction):
         return await interaction.response.send_message("Permission denied.", ephemeral=True)
-    
     await interaction.response.defer(ephemeral=True)
-    
     if ticket_type.value == "Complaint":
-        await create_ticket_logic(interaction.guild, member, "Complaint", "Staff-initiated complaint ticket.", COMPLAINT_CATEGORY_ID, [SUPERVISOR_ROLE_ID], interaction)
-    elif ticket_type.value == "Server":
-        await create_ticket_logic(interaction.guild, member, "Server", MACROS["server_issue_questions"], TICKET_CATEGORY_ID, [STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID], interaction)
+        await create_ticket_logic(interaction.guild, member, "Complaint", "Staff-initiated complaint.", COMPLAINT_CATEGORY_ID, [SUPERVISOR_ROLE_ID], interaction)
     else:
-        await create_ticket_logic(interaction.guild, member, "Game", MACROS["game_support_questions"], TICKET_CATEGORY_ID, [STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID], interaction)
+        await create_ticket_logic(interaction.guild, member, ticket_type.value, "Staff-initiated support request.", TICKET_CATEGORY_ID, [STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID], interaction)
 
-@bot.tree.command(name="merge", description="Merge this ticket's history into another ticket and close this one")
-@app_commands.describe(target_channel="The correct ticket channel to move messages to")
+@bot.tree.command(name="merge", description="Merge this ticket's history")
 async def merge(interaction: discord.Interaction, target_channel: discord.TextChannel):
-    if not is_staff_or_supervisor(interaction):
+    if not is_staff_or_higher(interaction):
         return await interaction.response.send_message("Permission denied.", ephemeral=True)
-
-    if interaction.channel.id == target_channel.id:
-        return await interaction.response.send_message("Cannot merge a channel into itself.", ephemeral=True)
-
-    await interaction.response.send_message(f"Merging content into {target_channel.mention}... This may take a moment.")
-    
+    await interaction.response.send_message(f"Merging content into {target_channel.mention}...")
     async with aiohttp.ClientSession() as session:
         async for message in interaction.channel.history(limit=100, oldest_first=True):
             if message.author == bot.user and message.embeds: continue
-            
-            content = f"**[Merged from {interaction.channel.name}]**\n**{message.author.display_name}:** {message.content}"
-            files = []
-            
-            for attachment in message.attachments:
-                async with session.get(attachment.url) as resp:
-                    if resp.status == 200:
-                        data = io.BytesIO(await resp.read())
-                        files.append(discord.File(data, filename=attachment.filename))
-            
-            if message.content.strip() or files:
-                await target_channel.send(content=content if message.content else f"**[Merged] {message.author.display_name}:**", files=files)
-                await asyncio.sleep(0.5)
-
-    await interaction.channel.send("✅ Merge complete. Channel deleting...")
-    await asyncio.sleep(3)
+            content = f"**[Merged] {message.author.display_name}:** {message.content}"
+            await target_channel.send(content=content)
     await interaction.channel.delete()
 
 # --- TASKS & EVENTS ---
@@ -405,18 +392,15 @@ async def check_inactive_tickets():
     category = guild.get_channel(TICKET_CATEGORY_ID)
     if not category: return
     now = discord.utils.utcnow()
-    warn_delta = datetime.timedelta(hours=INACTIVITY_WARN_AFTER_HOURS)
-    close_delta = datetime.timedelta(hours=INACTIVITY_CLOSE_AFTER_HOURS)
-    
     for channel in category.text_channels:
         if not channel.topic or "Ticket for" not in channel.topic: continue
         try:
             msgs = [m async for m in channel.history(limit=1)]
             if not msgs: continue
             last_msg = msgs[0]
-            if now - last_msg.created_at > close_delta:
+            if now - last_msg.created_at > datetime.timedelta(hours=INACTIVITY_CLOSE_AFTER_HOURS):
                 await close_and_log_ticket(channel, bot.user, "Automated closing due to inactivity.")
-            elif now - last_msg.created_at > warn_delta:
+            elif now - last_msg.created_at > datetime.timedelta(hours=INACTIVITY_WARN_AFTER_HOURS):
                 if not (last_msg.author == bot.user):
                     await channel.send("⚠️ This ticket is inactive and will be closed automatically in 24 hours.")
         except: continue
@@ -428,15 +412,9 @@ async def on_ready():
         guild = discord.Object(id=GUILD_ID)
         bot.tree.copy_global_to(guild=guild)
         await bot.tree.sync(guild=guild)
-        print(f"SUCCESS: Synced commands to guild {GUILD_ID}")
-    except Exception as e:
-        print(f"SYNC ERROR: {e}")
-    if not check_inactive_tickets.is_running():
-        check_inactive_tickets.start()
+    except Exception as e: print(f"SYNC ERROR: {e}")
+    if not check_inactive_tickets.is_running(): check_inactive_tickets.start()
 
 if __name__ == "__main__":
     keep_alive()
-    if BOT_TOKEN:
-        bot.run(BOT_TOKEN)
-    else:
-        print("CRITICAL: No DISCORD_TOKEN found!")
+    if BOT_TOKEN: bot.run(BOT_TOKEN)
