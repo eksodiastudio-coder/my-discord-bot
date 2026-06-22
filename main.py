@@ -41,6 +41,11 @@ COMPLAINT_CATEGORY_ID = 1428497122759671881
 COMPLAINT_LOG_CHANNEL_ID = 1428499253952774176
 FEEDBACK_LOG_CHANNEL_ID = 1430296240528294049 
 
+# --- AUTO-ASSIGNMENT CONFIG ---
+TRIAL_MOD_ROLE_ID = 1518663064956702890 
+AUTO_ASSIGN_ENABLED = False 
+ASSIGNMENT_INDEX = 0  # Global counter for Round Robin rotation
+
 INACTIVITY_WARN_AFTER_HOURS = 24
 INACTIVITY_CLOSE_AFTER_HOURS = 48
 CHECK_INTERVAL_MINUTES = 5
@@ -89,7 +94,7 @@ def is_staff_or_supervisor(interaction: discord.Interaction) -> bool:
     return any(role in user_roles for role in [staff_role, staff_lead_role, supervisor_role])
 
 async def create_ticket_logic(guild, member, ticket_type, questions, category_id, roles_to_add, interaction: discord.Interaction):
-    """Refactored logic to handle ticket creation for both buttons and commands."""
+    global AUTO_ASSIGN_ENABLED, ASSIGNMENT_INDEX
     category = guild.get_channel(category_id)
     if not category:
         return await interaction.followup.send("Error: Ticket category not found.", ephemeral=True)
@@ -107,10 +112,35 @@ async def create_ticket_logic(guild, member, ticket_type, questions, category_id
         guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
     }
     
+    # Base permissions for staff roles
     for role_id in roles_to_add:
         role = guild.get_role(role_id)
         if role:
-            overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+            # If auto-assign is ON, staff are View-Only (cannot send messages)
+            can_send = not AUTO_ASSIGN_ENABLED if ticket_type != "Complaint" else True
+            overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=can_send)
+
+    assigned_trial = None
+    # Round-Robin Logic with Inactivity Check
+    if AUTO_ASSIGN_ENABLED and ticket_type != "Complaint":
+        trial_role = guild.get_role(TRIAL_MOD_ROLE_ID)
+        inactive_role = guild.get_role(INACTIVE_ROLE_ID)
+        
+        if trial_role:
+            # Filter: Must have Trial Mod role AND NOT have the Inactive role
+            available_trials = [
+                m for m in trial_role.members 
+                if not m.bot and (not inactive_role or inactive_role not in m.roles)
+            ]
+            
+            # Sort by ID for consistent rotation
+            available_trials.sort(key=lambda x: x.id)
+            
+            if available_trials:
+                assigned_trial = available_trials[ASSIGNMENT_INDEX % len(available_trials)]
+                ASSIGNMENT_INDEX += 1
+                # Grant the specific assigned Trial SEND permissions
+                overwrites[assigned_trial] = discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True)
 
     channel = await category.create_text_channel(
         name=f"{ticket_type}-{member.name}",
@@ -119,10 +149,24 @@ async def create_ticket_logic(guild, member, ticket_type, questions, category_id
     )
 
     embed = discord.Embed(title=f"{ticket_type} Support Request", description=f"Hello {member.mention}!\n\n{questions}", color=discord.Color.blue())
+    
+    view = TicketActionView(show_claim=(ticket_type != "Complaint"))
+    
+    if assigned_trial:
+        embed.add_field(name="Assigned Trial Moderator", value=f"{assigned_trial.mention}\n*Next in rotation.*")
+        for item in view.children:
+            if isinstance(item, Button) and item.custom_id == "claim_ticket":
+                item.disabled = True
+                item.label = f"Assigned: {assigned_trial.display_name}"
+
     if interaction.user != member:
         embed.set_footer(text=f"Ticket opened by staff: {interaction.user.display_name}")
 
-    await channel.send(embed=embed, view=TicketActionView(show_claim=(ticket_type != "Complaint")))
+    await channel.send(embed=embed, view=view)
+    
+    if assigned_trial:
+        await channel.send(f"{assigned_trial.mention}, you have been automatically assigned to this ticket.")
+
     await interaction.followup.send(f"Ticket created: {channel.mention}", ephemeral=True)
     return channel
 
@@ -270,6 +314,20 @@ bot = MyBot()
 
 # --- COMMANDS ---
 
+@bot.tree.command(name="assignon", description="Enable round-robin auto-assignment for Trial Moderators")
+@app_commands.default_permissions(administrator=True)
+async def assignon(interaction: discord.Interaction):
+    global AUTO_ASSIGN_ENABLED
+    AUTO_ASSIGN_ENABLED = True
+    await interaction.response.send_message("✅ **Ticket Auto-Assignment is now ON.**\n- Tickets will rotate through Active Trial Moderators.\n- Staff Role is View-Only until disabled.", ephemeral=False)
+
+@bot.tree.command(name="assignoff", description="Disable auto-assignment for Trial Moderators")
+@app_commands.default_permissions(administrator=True)
+async def assignoff(interaction: discord.Interaction):
+    global AUTO_ASSIGN_ENABLED
+    AUTO_ASSIGN_ENABLED = False
+    await interaction.response.send_message("❌ **Ticket Auto-Assignment is now OFF.**\n- Manual claiming is restored for all staff.", ephemeral=False)
+
 @bot.tree.command(name="setup_tickets", description="Setup the ticket support panel")
 @app_commands.default_permissions(administrator=True)
 async def setup_tickets(interaction: discord.Interaction):
@@ -317,11 +375,8 @@ async def merge(interaction: discord.Interaction, target_channel: discord.TextCh
 
     await interaction.response.send_message(f"Merging content into {target_channel.mention}... This may take a moment.")
     
-    # Use a session to download images
     async with aiohttp.ClientSession() as session:
-        # Limit history to 100 messages to prevent infinite processing
         async for message in interaction.channel.history(limit=100, oldest_first=True):
-            # Skip the initial welcome embed from the bot
             if message.author == bot.user and message.embeds: continue
             
             content = f"**[Merged from {interaction.channel.name}]**\n**{message.author.display_name}:** {message.content}"
@@ -335,7 +390,7 @@ async def merge(interaction: discord.Interaction, target_channel: discord.TextCh
             
             if message.content.strip() or files:
                 await target_channel.send(content=content if message.content else f"**[Merged] {message.author.display_name}:**", files=files)
-                await asyncio.sleep(0.5) # Avoid rate limits
+                await asyncio.sleep(0.5)
 
     await interaction.channel.send("✅ Merge complete. Channel deleting...")
     await asyncio.sleep(3)
