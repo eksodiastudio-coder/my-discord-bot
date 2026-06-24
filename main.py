@@ -44,7 +44,7 @@ FEEDBACK_LOG_CHANNEL_ID = 1430296240528294049
 # --- AUTO-ASSIGNMENT CONFIG ---
 TRIAL_MOD_ROLE_ID = 1518663064956702890 
 AUTO_ASSIGN_ENABLED = False 
-ASSIGNMENT_INDEX = 0  # Global counter for Round Robin rotation
+ASSIGNMENT_INDEX = 0 
 
 INACTIVITY_WARN_AFTER_HOURS = 24
 INACTIVITY_CLOSE_AFTER_HOURS = 48
@@ -87,8 +87,9 @@ MACROS = {
 # --- HELPERS ---
 
 def is_staff_or_higher(interaction: discord.Interaction) -> bool:
-    """Checks if user has Staff, Staff Lead, or Supervisor role."""
-    roles = [STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID]
+    """Checks if user has Trial Mod, Staff, Staff Lead, or Supervisor role."""
+    # MODIFIED: Added TRIAL_MOD_ROLE_ID so they can claim tickets
+    roles = [STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID, TRIAL_MOD_ROLE_ID]
     return any(role.id in roles for role in interaction.user.roles)
 
 def is_lead_or_supervisor(interaction: discord.Interaction) -> bool:
@@ -102,7 +103,6 @@ async def create_ticket_logic(guild, member, ticket_type, questions, category_id
     if not category:
         return await interaction.followup.send("Error: Ticket category not found.", ephemeral=True)
 
-    # Check for existing tickets
     for channel in category.text_channels:
         if channel.topic and str(member.id) in channel.topic:
             return await interaction.followup.send(f"{member.display_name} already has a ticket open here: {channel.mention}", ephemeral=True)
@@ -115,37 +115,34 @@ async def create_ticket_logic(guild, member, ticket_type, questions, category_id
         guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
     }
     
-    # Base permissions for staff roles
-    for role_id in roles_to_add:
+    # MODIFIED: Add all staff roles to overwrites immediately
+    all_staff_roles = [STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID, TRIAL_MOD_ROLE_ID]
+    for role_id in all_staff_roles:
         role = guild.get_role(role_id)
         if role:
-            # FIX: Staff Lead and Supervisor should ALWAYS be able to talk. 
-            # Only the standard Staff role is restricted if auto-assign is ON.
+            # Staff Lead and Supervisor can ALWAYS talk
             if role_id in [STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID]:
                 overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True)
             else:
+                # Standard Staff and Trial Mods are read-only if Auto-Assign is ON
                 can_send = not AUTO_ASSIGN_ENABLED if ticket_type != "Complaint" else True
                 overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=can_send, attach_files=can_send)
 
     assigned_trial = None
-    # Round-Robin Logic with Inactivity check
     if AUTO_ASSIGN_ENABLED and ticket_type != "Complaint":
         trial_role = guild.get_role(TRIAL_MOD_ROLE_ID)
         inactive_role = guild.get_role(INACTIVE_ROLE_ID)
         
         if trial_role:
-            # Filter: Must have Trial Mod role AND NOT have the Inactive role
             available_trials = [
                 m for m in trial_role.members 
                 if not m.bot and (not inactive_role or inactive_role not in m.roles)
             ]
-            # Sort by ID for consistent rotation
             available_trials.sort(key=lambda x: x.id)
             
             if available_trials:
                 assigned_trial = available_trials[ASSIGNMENT_INDEX % len(available_trials)]
                 ASSIGNMENT_INDEX += 1
-                # Grant the specific assigned Trial SEND permissions
                 overwrites[assigned_trial] = discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True)
 
     channel = await category.create_text_channel(
@@ -163,9 +160,6 @@ async def create_ticket_logic(guild, member, ticket_type, questions, category_id
             if isinstance(item, Button) and item.custom_id == "claim_ticket":
                 item.disabled = True
                 item.label = f"Assigned: {assigned_trial.display_name}"
-
-    if interaction.user != member:
-        embed.set_footer(text=f"Ticket opened by staff: {interaction.user.display_name}")
 
     await channel.send(embed=embed, view=view)
     if assigned_trial:
@@ -272,9 +266,13 @@ class TicketActionView(View):
         await interaction.response.edit_message(view=self)
         
         staff_role = interaction.guild.get_role(STAFF_ROLE_ID)
-        await interaction.channel.set_permissions(staff_role, send_messages=False, read_messages=True)
-        await interaction.channel.set_permissions(interaction.user, send_messages=True, read_messages=True, attach_files=True)
+        trial_role = interaction.guild.get_role(TRIAL_MOD_ROLE_ID)
         
+        # When claimed, lock it for other staff roles but grant the claimer permissions
+        if staff_role: await interaction.channel.set_permissions(staff_role, send_messages=False, read_messages=True)
+        if trial_role: await interaction.channel.set_permissions(trial_role, send_messages=False, read_messages=True)
+        
+        await interaction.channel.set_permissions(interaction.user, send_messages=True, read_messages=True, attach_files=True)
         await interaction.followup.send(f"Ticket claimed by {interaction.user.mention}. Other staff can now only view.")
 
     @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="close_ticket", emoji="🔒")
@@ -346,21 +344,19 @@ async def removeassign(interaction: discord.Interaction):
     lead_role = guild.get_role(STAFF_LEAD_ROLE_ID)
     trial_role = guild.get_role(TRIAL_MOD_ROLE_ID)
 
-    # Restore Send Permissions for standard staff roles
+    # MODIFIED: Explicitly restore permissions for all staff roles, including Trial Mod
     if staff_role: await interaction.channel.set_permissions(staff_role, send_messages=True, read_messages=True, attach_files=True)
     if lead_role: await interaction.channel.set_permissions(lead_role, send_messages=True, read_messages=True, attach_files=True)
-    
-    # FIX: Explicitly restore Trial Mod role visibility so they don't disappear
     if trial_role: await interaction.channel.set_permissions(trial_role, send_messages=True, read_messages=True, attach_files=True)
 
-    # Remove the specific trial moderator's member-specific overwrite to reset the channel
+    # Clear specific member-overwrites (to remove the assigned person)
     for target, overwrite in interaction.channel.overwrites.items():
         if isinstance(target, discord.Member) and not target.bot:
-            # Clear them ONLY if they aren't the ticket owner
             if str(target.id) not in interaction.channel.topic:
                 await interaction.channel.set_permissions(target, overwrite=None)
 
-    await interaction.followup.send("🔓 **Ticket Assignment Removed.** Standard staff and Trial moderators can now speak and claim this ticket manually.", view=TicketActionView(show_claim=True))
+    # MODIFIED: Send a FRESH Claim view because the old one's button was disabled
+    await interaction.followup.send("🔓 **Ticket Assignment Removed.** Standard staff and Trial moderators can now claim this ticket.", view=TicketActionView(show_claim=True))
 
 @bot.tree.command(name="setup_tickets", description="Setup the ticket support panel")
 @app_commands.default_permissions(administrator=True)
