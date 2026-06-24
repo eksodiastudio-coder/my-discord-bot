@@ -119,9 +119,13 @@ async def create_ticket_logic(guild, member, ticket_type, questions, category_id
     for role_id in roles_to_add:
         role = guild.get_role(role_id)
         if role:
-            # If auto-assign is ON, staff are View-Only (cannot send messages)
-            can_send = not AUTO_ASSIGN_ENABLED if ticket_type != "Complaint" else True
-            overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=can_send)
+            # FIX: Staff Lead and Supervisor should ALWAYS be able to talk. 
+            # Only the standard Staff role is restricted if auto-assign is ON.
+            if role_id in [STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID]:
+                overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True)
+            else:
+                can_send = not AUTO_ASSIGN_ENABLED if ticket_type != "Complaint" else True
+                overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=can_send, attach_files=can_send)
 
     assigned_trial = None
     # Round-Robin Logic with Inactivity check
@@ -340,19 +344,23 @@ async def removeassign(interaction: discord.Interaction):
     guild = interaction.guild
     staff_role = guild.get_role(STAFF_ROLE_ID)
     lead_role = guild.get_role(STAFF_LEAD_ROLE_ID)
+    trial_role = guild.get_role(TRIAL_MOD_ROLE_ID)
 
     # Restore Send Permissions for standard staff roles
     if staff_role: await interaction.channel.set_permissions(staff_role, send_messages=True, read_messages=True, attach_files=True)
     if lead_role: await interaction.channel.set_permissions(lead_role, send_messages=True, read_messages=True, attach_files=True)
+    
+    # FIX: Explicitly restore Trial Mod role visibility so they don't disappear
+    if trial_role: await interaction.channel.set_permissions(trial_role, send_messages=True, read_messages=True, attach_files=True)
 
-    # Remove the specific trial moderator's overwrite to reset the channel
+    # Remove the specific trial moderator's member-specific overwrite to reset the channel
     for target, overwrite in interaction.channel.overwrites.items():
         if isinstance(target, discord.Member) and not target.bot:
             # Clear them ONLY if they aren't the ticket owner
             if str(target.id) not in interaction.channel.topic:
                 await interaction.channel.set_permissions(target, overwrite=None)
 
-    await interaction.followup.send("🔓 **Ticket Assignment Removed.** Standard staff roles can now speak and claim this ticket manually.", view=TicketActionView(show_claim=True))
+    await interaction.followup.send("🔓 **Ticket Assignment Removed.** Standard staff and Trial moderators can now speak and claim this ticket manually.", view=TicketActionView(show_claim=True))
 
 @bot.tree.command(name="setup_tickets", description="Setup the ticket support panel")
 @app_commands.default_permissions(administrator=True)
