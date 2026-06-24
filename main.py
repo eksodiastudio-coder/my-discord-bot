@@ -115,34 +115,32 @@ async def create_ticket_logic(guild, member, ticket_type, questions, category_id
         guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
     }
     
-    # MODIFIED: Add all staff roles to overwrites immediately
+    # Define all roles that should see the ticket
     all_staff_roles = [STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID, TRIAL_MOD_ROLE_ID]
+    
     for role_id in all_staff_roles:
         role = guild.get_role(role_id)
         if role:
-            # Staff Lead and Supervisor can ALWAYS talk
+            # EVERYONE in the staff list gets read_messages=True
             if role_id in [STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID]:
+                # Leads and Supervisors can always see AND talk
                 overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True)
             else:
-                # Standard Staff and Trial Mods are read-only if Auto-Assign is ON
+                # Standard Staff and Trial Mods can always see, but can only talk if Auto-Assign is OFF
                 can_send = not AUTO_ASSIGN_ENABLED if ticket_type != "Complaint" else True
                 overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=can_send, attach_files=can_send)
 
     assigned_trial = None
     if AUTO_ASSIGN_ENABLED and ticket_type != "Complaint":
         trial_role = guild.get_role(TRIAL_MOD_ROLE_ID)
-        inactive_role = guild.get_role(INACTIVE_ROLE_ID)
-        
+        inactive_role = guild.get_role(INACTIVITY_ROLE_ID)
         if trial_role:
-            available_trials = [
-                m for m in trial_role.members 
-                if not m.bot and (not inactive_role or inactive_role not in m.roles)
-            ]
+            available_trials = [m for m in trial_role.members if not m.bot and (not inactive_role or inactive_role not in m.roles)]
             available_trials.sort(key=lambda x: x.id)
-            
             if available_trials:
                 assigned_trial = available_trials[ASSIGNMENT_INDEX % len(available_trials)]
                 ASSIGNMENT_INDEX += 1
+                # Assigned trial gets explicit talk permissions
                 overwrites[assigned_trial] = discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True)
 
     channel = await category.create_text_channel(
@@ -267,13 +265,24 @@ class TicketActionView(View):
         
         staff_role = interaction.guild.get_role(STAFF_ROLE_ID)
         trial_role = interaction.guild.get_role(TRIAL_MOD_ROLE_ID)
+        lead_role = interaction.guild.get_role(STAFF_LEAD_ROLE_ID)
+        supervisor_role = interaction.guild.get_role(SUPERVISOR_ROLE_ID)
         
-        # When claimed, lock it for other staff roles but grant the claimer permissions
-        if staff_role: await interaction.channel.set_permissions(staff_role, send_messages=False, read_messages=True)
-        if trial_role: await interaction.channel.set_permissions(trial_role, send_messages=False, read_messages=True)
+        # When claimed, set others to View-Only (read=True, send=False)
+        if staff_role: 
+            await interaction.channel.set_permissions(staff_role, read_messages=True, send_messages=False)
+        if trial_role: 
+            await interaction.channel.set_permissions(trial_role, read_messages=True, send_messages=False)
         
-        await interaction.channel.set_permissions(interaction.user, send_messages=True, read_messages=True, attach_files=True)
-        await interaction.followup.send(f"Ticket claimed by {interaction.user.mention}. Other staff can now only view.")
+        # Ensure Leads and Supervisors can still talk to assist
+        if lead_role:
+            await interaction.channel.set_permissions(lead_role, read_messages=True, send_messages=True)
+        if supervisor_role:
+            await interaction.channel.set_permissions(supervisor_role, read_messages=True, send_messages=True)
+        
+        # Grant the claimer full permissions
+        await interaction.channel.set_permissions(interaction.user, read_messages=True, send_messages=True, attach_files=True)
+        await interaction.followup.send(f"Ticket claimed by {interaction.user.mention}. Other staff roles are now set to **View-Only**.")
 
     @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="close_ticket", emoji="🔒")
     async def close_ticket_button(self, interaction: discord.Interaction, button: Button):
@@ -343,20 +352,22 @@ async def removeassign(interaction: discord.Interaction):
     staff_role = guild.get_role(STAFF_ROLE_ID)
     lead_role = guild.get_role(STAFF_LEAD_ROLE_ID)
     trial_role = guild.get_role(TRIAL_MOD_ROLE_ID)
+    supervisor_role = guild.get_role(SUPERVISOR_ROLE_ID)
 
-    # MODIFIED: Explicitly restore permissions for all staff roles, including Trial Mod
-    if staff_role: await interaction.channel.set_permissions(staff_role, send_messages=True, read_messages=True, attach_files=True)
-    if lead_role: await interaction.channel.set_permissions(lead_role, send_messages=True, read_messages=True, attach_files=True)
-    if trial_role: await interaction.channel.set_permissions(trial_role, send_messages=True, read_messages=True, attach_files=True)
+    # Restore full access (Read + Send) for all relevant roles
+    roles_to_restore = [staff_role, lead_role, trial_role, supervisor_role]
+    for role in roles_to_restore:
+        if role:
+            await interaction.channel.set_permissions(role, read_messages=True, send_messages=True, attach_files=True)
 
-    # Clear specific member-overwrites (to remove the assigned person)
+    # Clear specific member-overwrites (removes the previously assigned/claimed person's special permissions)
     for target, overwrite in interaction.channel.overwrites.items():
         if isinstance(target, discord.Member) and not target.bot:
+            # Don't remove permissions from the ticket owner
             if str(target.id) not in interaction.channel.topic:
                 await interaction.channel.set_permissions(target, overwrite=None)
 
-    # MODIFIED: Send a FRESH Claim view because the old one's button was disabled
-    await interaction.followup.send("🔓 **Ticket Assignment Removed.** Standard staff and Trial moderators can now claim this ticket.", view=TicketActionView(show_claim=True))
+    await interaction.followup.send("🔓 **Ticket Assignment Removed.** Visibility and chat restored for all Staff and Trial Moderators.", view=TicketActionView(show_claim=True))
 
 @bot.tree.command(name="setup_tickets", description="Setup the ticket support panel")
 @app_commands.default_permissions(administrator=True)
