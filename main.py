@@ -345,13 +345,16 @@ async def removeassign(interaction: discord.Interaction, member: discord.Member 
     if not interaction.channel.topic or "Ticket for" not in interaction.channel.topic:
         return await interaction.response.send_message("This command can only be used inside a ticket channel.", ephemeral=True)
     
+    removed_any = False
+    guild = interaction.guild
+    trial_role = guild.get_role(TRIAL_MOD_ROLE_ID)
+    msg_text = ""
+    
     if member:
         await interaction.channel.set_permissions(member, overwrite=None)
-        await interaction.response.send_message(f"Removed assignment/permissions for {member.mention}.")
+        removed_any = True
+        msg_text = f"Removed assignment/permissions for {member.mention}."
     else:
-        guild = interaction.guild
-        trial_role = guild.get_role(TRIAL_MOD_ROLE_ID)
-        
         removed_members = []
         for target in list(interaction.channel.overwrites.keys()):
             if isinstance(target, discord.Member):
@@ -360,9 +363,25 @@ async def removeassign(interaction: discord.Interaction, member: discord.Member 
                     removed_members.append(target.mention)
         
         if removed_members:
-            await interaction.response.send_message(f"Removed assignment for: {', '.join(removed_members)}")
+            removed_any = True
+            msg_text = f"Removed assignment for: {', '.join(removed_members)}."
         else:
-            await interaction.response.send_message("No assigned Trial Moderator with custom permissions found in this channel.", ephemeral=True)
+            msg_text = "No assigned Trial Moderator with custom permissions found in this channel."
+
+    if removed_any:
+        # Scan and update the main bot embed inside the channel to re-enable claiming
+        async for msg in interaction.channel.history(limit=30, oldest_first=True):
+            if msg.author == bot.user and msg.embeds:
+                embed = msg.embeds[0]
+                embed.clear_fields()  # Remove assignment fields
+                
+                # Edit with active TicketActionView containing the active claim button
+                await msg.edit(embed=embed, view=TicketActionView(show_claim=True))
+                break
+                
+        await interaction.response.send_message(f"✅ {msg_text} Ticket is now open for claiming by standard staff or trial moderators.")
+    else:
+        await interaction.response.send_message(msg_text, ephemeral=True)
 
 @bot.tree.command(name="createticket", description="Create a ticket on behalf of a member")
 @app_commands.choices(ticket_type=[
