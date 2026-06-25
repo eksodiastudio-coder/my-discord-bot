@@ -36,7 +36,7 @@ STAFF_LEAD_ROLE_ID = 1459994445121323079
 LOG_CHANNEL_ID = 1428478091474505750      
 
 SUPERVISOR_ROLE_ID = 1428489953477922996  
-INACTIVE_ROLE_ID = 1428490017420087478    
+INACTIVITY_ROLE_ID = 1428490017420087478    
 COMPLAINT_CATEGORY_ID = 1428497122759671881 
 COMPLAINT_LOG_CHANNEL_ID = 1428499253952774176
 FEEDBACK_LOG_CHANNEL_ID = 1430296240528294049 
@@ -88,11 +88,11 @@ MACROS = {
 
 def is_staff_or_higher(interaction: discord.Interaction) -> bool:
     roles = [STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID, TRIAL_MOD_ROLE_ID]
-    return any(role.id in roles for role in interaction.user.roles)
+    return any(role.id in [r.id for r in interaction.user.roles] for role in roles)
 
 def is_lead_or_supervisor(interaction: discord.Interaction) -> bool:
     roles = [STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID]
-    return any(role.id in roles for role in interaction.user.roles)
+    return any(role.id in [r.id for r in interaction.user.roles] for role in roles)
 
 async def create_ticket_logic(guild, member, ticket_type, questions, category_id, interaction: discord.Interaction):
     global AUTO_ASSIGN_ENABLED, ASSIGNMENT_INDEX
@@ -106,32 +106,26 @@ async def create_ticket_logic(guild, member, ticket_type, questions, category_id
 
     ticket_id = f"{ticket_type[:3].upper()}-{random.randint(1000, 9999)}-{random.randint(100, 999)}"
     
-    # Base Overwrites
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(read_messages=False),
         member: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
         guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True, manage_permissions=True)
     }
     
-    # PRIVACY LOGIC
     standard_staff_roles = [TRIAL_MOD_ROLE_ID, STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID]
     supervisor_role = guild.get_role(SUPERVISOR_ROLE_ID)
 
     if ticket_type == "Complaint":
-        # 1. EXPLICITLY HIDE from standard staff
         for role_id in standard_staff_roles:
             role = guild.get_role(role_id)
             if role: overwrites[role] = discord.PermissionOverwrite(read_messages=False)
-        # 2. ALLOW Supervisor
         if supervisor_role:
             overwrites[supervisor_role] = discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True)
     else:
-        # ALLOW ALL STAFF for standard tickets
         all_ids = standard_staff_roles + [SUPERVISOR_ROLE_ID]
         for role_id in all_ids:
             role = guild.get_role(role_id)
             if role:
-                # Leads and Supervisors always talk. Trial/Staff talk if Auto-assign is off.
                 can_talk = (role_id in [STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID]) or (not AUTO_ASSIGN_ENABLED)
                 overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=can_talk, attach_files=can_talk)
 
@@ -175,6 +169,7 @@ class CloseTicketModal(Modal, title="Close Ticket"):
     reason = TextInput(label="Reason for Closing", placeholder="Provide a reason for the user...", style=discord.TextStyle.paragraph, required=True)
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Immediate response to prevent interaction timeout
         await interaction.response.send_message("Processing ticket closure...", ephemeral=True)
         await close_and_log_ticket(interaction.channel, interaction.user, reason=self.reason.value)
 
@@ -282,12 +277,13 @@ class TicketActionView(View):
             await interaction.channel.set_permissions(supervisor_role, read_messages=True, send_messages=True)
         
         await interaction.channel.set_permissions(interaction.user, read_messages=True, send_messages=True, attach_files=True)
-        await interaction.followup.send(f"Ticket claimed by {interaction.user.mention}. Other staff roles are now set to **View-Only**.")
+        await interaction.followup.send(f"Ticket claimed by {interaction.user.mention}.")
 
     @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="close_ticket", emoji="🔒")
     async def close_ticket_button(self, interaction: discord.Interaction, button: Button):
         if not is_staff_or_higher(interaction): 
             return await interaction.response.send_message("Permission denied.", ephemeral=True)
+        # Directly send modal as the interaction response
         await interaction.response.send_modal(CloseTicketModal())
 
 class TicketControlPanelView(View):
@@ -362,16 +358,34 @@ async def setup_tickets(interaction: discord.Interaction):
     await interaction.channel.send(embed=embed, view=TicketControlPanelView())
     await interaction.response.send_message("✅ Panel posted!", ephemeral=True)
 
-@bot.tree.command(name="merge", description="Merge this ticket's history")
+@bot.tree.command(name="merge", description="Merge this ticket's history including images")
 async def merge(interaction: discord.Interaction, target_channel: discord.TextChannel):
     if not is_staff_or_higher(interaction):
         return await interaction.response.send_message("Permission denied.", ephemeral=True)
+    
     await interaction.response.send_message(f"Merging content into {target_channel.mention}...")
-    async with aiohttp.ClientSession() as session:
-        async for message in interaction.channel.history(limit=100, oldest_first=True):
-            if message.author == bot.user and message.embeds: continue
-            content = f"**[Merged] {message.author.display_name}:** {message.content}"
-            await target_channel.send(content=content)
+    
+    async for message in interaction.channel.history(limit=100, oldest_first=True):
+        # Skip bot embeds (like the initial ticket message)
+        if message.author == bot.user and message.embeds: continue
+        
+        # Prepare content
+        content = f"**[Merged] {message.author.display_name}:** {message.content}"
+        
+        # Handle attachments
+        files = []
+        for attachment in message.attachments:
+            # Download file into memory
+            file_bytes = await attachment.read()
+            files.append(discord.File(io.BytesIO(file_bytes), filename=attachment.filename))
+        
+        if content.strip() or files:
+            await target_channel.send(content=content if content.strip() else None, files=files)
+            # Small delay to avoid rate limits during bulk transfer
+            await asyncio.sleep(0.5)
+
+    await interaction.channel.send("Merge complete. Deleting channel in 5 seconds.")
+    await asyncio.sleep(5)
     await interaction.channel.delete()
 
 # --- TASKS & EVENTS ---
