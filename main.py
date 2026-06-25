@@ -87,17 +87,14 @@ MACROS = {
 # --- HELPERS ---
 
 def is_staff_or_higher(interaction: discord.Interaction) -> bool:
-    """Checks if user has Trial Mod, Staff, Staff Lead, or Supervisor role."""
-    # MODIFIED: Added TRIAL_MOD_ROLE_ID so they can claim tickets
     roles = [STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID, TRIAL_MOD_ROLE_ID]
     return any(role.id in roles for role in interaction.user.roles)
 
 def is_lead_or_supervisor(interaction: discord.Interaction) -> bool:
-    """Checks if user has Staff Lead or Supervisor role."""
     roles = [STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID]
     return any(role.id in roles for role in interaction.user.roles)
 
-async def create_ticket_logic(guild, member, ticket_type, questions, category_id, roles_to_add, interaction: discord.Interaction):
+async def create_ticket_logic(guild, member, ticket_type, questions, category_id, interaction: discord.Interaction):
     global AUTO_ASSIGN_ENABLED, ASSIGNMENT_INDEX
     category = guild.get_channel(category_id)
     if not category:
@@ -109,26 +106,34 @@ async def create_ticket_logic(guild, member, ticket_type, questions, category_id
 
     ticket_id = f"{ticket_type[:3].upper()}-{random.randint(1000, 9999)}-{random.randint(100, 999)}"
     
+    # Base Overwrites
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(read_messages=False),
-        member: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True),
-        guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
+        member: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
+        guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True, manage_permissions=True)
     }
     
-    # Define all roles that should see the ticket
-    all_staff_roles = [STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID, TRIAL_MOD_ROLE_ID]
-    
-    for role_id in all_staff_roles:
-        role = guild.get_role(role_id)
-        if role:
-            # EVERYONE in the staff list gets read_messages=True
-            if role_id in [STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID]:
-                # Leads and Supervisors can always see AND talk
-                overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True)
-            else:
-                # Standard Staff and Trial Mods can always see, but can only talk if Auto-Assign is OFF
-                can_send = not AUTO_ASSIGN_ENABLED if ticket_type != "Complaint" else True
-                overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=can_send, attach_files=can_send)
+    # PRIVACY LOGIC
+    standard_staff_roles = [TRIAL_MOD_ROLE_ID, STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID]
+    supervisor_role = guild.get_role(SUPERVISOR_ROLE_ID)
+
+    if ticket_type == "Complaint":
+        # 1. EXPLICITLY HIDE from standard staff
+        for role_id in standard_staff_roles:
+            role = guild.get_role(role_id)
+            if role: overwrites[role] = discord.PermissionOverwrite(read_messages=False)
+        # 2. ALLOW Supervisor
+        if supervisor_role:
+            overwrites[supervisor_role] = discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True)
+    else:
+        # ALLOW ALL STAFF for standard tickets
+        all_ids = standard_staff_roles + [SUPERVISOR_ROLE_ID]
+        for role_id in all_ids:
+            role = guild.get_role(role_id)
+            if role:
+                # Leads and Supervisors always talk. Trial/Staff talk if Auto-assign is off.
+                can_talk = (role_id in [STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID]) or (not AUTO_ASSIGN_ENABLED)
+                overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=can_talk, attach_files=can_talk)
 
     assigned_trial = None
     if AUTO_ASSIGN_ENABLED and ticket_type != "Complaint":
@@ -140,7 +145,6 @@ async def create_ticket_logic(guild, member, ticket_type, questions, category_id
             if available_trials:
                 assigned_trial = available_trials[ASSIGNMENT_INDEX % len(available_trials)]
                 ASSIGNMENT_INDEX += 1
-                # Assigned trial gets explicit talk permissions
                 overwrites[assigned_trial] = discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True)
 
     channel = await category.create_text_channel(
@@ -268,19 +272,15 @@ class TicketActionView(View):
         lead_role = interaction.guild.get_role(STAFF_LEAD_ROLE_ID)
         supervisor_role = interaction.guild.get_role(SUPERVISOR_ROLE_ID)
         
-        # When claimed, set others to View-Only (read=True, send=False)
         if staff_role: 
             await interaction.channel.set_permissions(staff_role, read_messages=True, send_messages=False)
         if trial_role: 
             await interaction.channel.set_permissions(trial_role, read_messages=True, send_messages=False)
-        
-        # Ensure Leads and Supervisors can still talk to assist
         if lead_role:
             await interaction.channel.set_permissions(lead_role, read_messages=True, send_messages=True)
         if supervisor_role:
             await interaction.channel.set_permissions(supervisor_role, read_messages=True, send_messages=True)
         
-        # Grant the claimer full permissions
         await interaction.channel.set_permissions(interaction.user, read_messages=True, send_messages=True, attach_files=True)
         await interaction.followup.send(f"Ticket claimed by {interaction.user.mention}. Other staff roles are now set to **View-Only**.")
 
@@ -296,17 +296,17 @@ class TicketControlPanelView(View):
     @discord.ui.button(label="Server Support", style=discord.ButtonStyle.primary, custom_id="btn_server", emoji="🖥️")
     async def server_support(self, interaction: discord.Interaction, button: Button): 
         await interaction.response.defer(ephemeral=True)
-        await create_ticket_logic(interaction.guild, interaction.user, "Server", MACROS["server_issue_questions"], TICKET_CATEGORY_ID, [STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID], interaction)
+        await create_ticket_logic(interaction.guild, interaction.user, "Server", MACROS["server_issue_questions"], TICKET_CATEGORY_ID, interaction)
 
     @discord.ui.button(label="Game Support", style=discord.ButtonStyle.success, custom_id="btn_game", emoji="🎮")
     async def game_support(self, interaction: discord.Interaction, button: Button): 
         await interaction.response.defer(ephemeral=True)
-        await create_ticket_logic(interaction.guild, interaction.user, "Game", MACROS["game_support_questions"], TICKET_CATEGORY_ID, [STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID], interaction)
+        await create_ticket_logic(interaction.guild, interaction.user, "Game", MACROS["game_support_questions"], TICKET_CATEGORY_ID, interaction)
 
     @discord.ui.button(label="File a Complaint", style=discord.ButtonStyle.danger, custom_id="btn_complaint", emoji="⚖️")
     async def complaint(self, interaction: discord.Interaction, button: Button): 
         await interaction.response.defer(ephemeral=True)
-        await create_ticket_logic(interaction.guild, interaction.user, "Complaint", "Describe your complaint in detail.", COMPLAINT_CATEGORY_ID, [SUPERVISOR_ROLE_ID], interaction)
+        await create_ticket_logic(interaction.guild, interaction.user, "Complaint", "Describe your complaint in detail.", COMPLAINT_CATEGORY_ID, interaction)
 
 # --- BOT SETUP ---
 class MyBot(commands.Bot):
@@ -329,7 +329,7 @@ async def assignon(interaction: discord.Interaction):
         return await interaction.response.send_message("Permission denied. Lead/Supervisor only.", ephemeral=True)
     global AUTO_ASSIGN_ENABLED
     AUTO_ASSIGN_ENABLED = True
-    await interaction.response.send_message("✅ **Ticket Auto-Assignment is now ON.**", ephemeral=False)
+    await interaction.response.send_message("✅ **Ticket Auto-Assignment is now ON.**")
 
 @bot.tree.command(name="assignoff", description="Disable auto-assignment for Trial Moderators")
 async def assignoff(interaction: discord.Interaction):
@@ -337,37 +337,23 @@ async def assignoff(interaction: discord.Interaction):
         return await interaction.response.send_message("Permission denied. Lead/Supervisor only.", ephemeral=True)
     global AUTO_ASSIGN_ENABLED
     AUTO_ASSIGN_ENABLED = False
-    await interaction.response.send_message("❌ **Ticket Auto-Assignment is now OFF.**", ephemeral=False)
+    await interaction.response.send_message("❌ **Ticket Auto-Assignment is now OFF.**")
 
-@bot.tree.command(name="removeassign", description="Unlock the ticket so any staff can claim it")
-async def removeassign(interaction: discord.Interaction):
-    if not is_lead_or_supervisor(interaction):
-        return await interaction.response.send_message("Permission denied. Lead/Supervisor only.", ephemeral=True)
+@bot.tree.command(name="createticket", description="Create a ticket on behalf of a member")
+@app_commands.choices(ticket_type=[
+    app_commands.Choice(name="Server Support", value="Server"),
+    app_commands.Choice(name="Game Support", value="Game"),
+    app_commands.Choice(name="Complaint", value="Complaint")
+])
+async def createticket(interaction: discord.Interaction, ticket_type: app_commands.Choice[str], member: discord.Member):
+    if not is_staff_or_higher(interaction):
+        return await interaction.response.send_message("Permission denied.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
     
-    if not interaction.channel.topic or "Ticket for" not in interaction.channel.topic:
-        return await interaction.response.send_message("This can only be used in ticket channels.", ephemeral=True)
-
-    await interaction.response.defer()
-    guild = interaction.guild
-    staff_role = guild.get_role(STAFF_ROLE_ID)
-    lead_role = guild.get_role(STAFF_LEAD_ROLE_ID)
-    trial_role = guild.get_role(TRIAL_MOD_ROLE_ID)
-    supervisor_role = guild.get_role(SUPERVISOR_ROLE_ID)
-
-    # Restore full access (Read + Send) for all relevant roles
-    roles_to_restore = [staff_role, lead_role, trial_role, supervisor_role]
-    for role in roles_to_restore:
-        if role:
-            await interaction.channel.set_permissions(role, read_messages=True, send_messages=True, attach_files=True)
-
-    # Clear specific member-overwrites (removes the previously assigned/claimed person's special permissions)
-    for target, overwrite in interaction.channel.overwrites.items():
-        if isinstance(target, discord.Member) and not target.bot:
-            # Don't remove permissions from the ticket owner
-            if str(target.id) not in interaction.channel.topic:
-                await interaction.channel.set_permissions(target, overwrite=None)
-
-    await interaction.followup.send("🔓 **Ticket Assignment Removed.** Visibility and chat restored for all Staff and Trial Moderators.", view=TicketActionView(show_claim=True))
+    cat_id = COMPLAINT_CATEGORY_ID if ticket_type.value == "Complaint" else TICKET_CATEGORY_ID
+    msg = "Staff-initiated complaint." if ticket_type.value == "Complaint" else "Staff-initiated support request."
+    
+    await create_ticket_logic(interaction.guild, member, ticket_type.value, msg, cat_id, interaction)
 
 @bot.tree.command(name="setup_tickets", description="Setup the ticket support panel")
 @app_commands.default_permissions(administrator=True)
@@ -375,16 +361,6 @@ async def setup_tickets(interaction: discord.Interaction):
     embed = discord.Embed(title="Support Center", description="Select a category below to open a ticket.", color=discord.Color.blue())
     await interaction.channel.send(embed=embed, view=TicketControlPanelView())
     await interaction.response.send_message("✅ Panel posted!", ephemeral=True)
-
-@bot.tree.command(name="createticket", description="Create a ticket on behalf of a member")
-async def createticket(interaction: discord.Interaction, ticket_type: app_commands.Choice[str], member: discord.Member):
-    if not is_staff_or_higher(interaction):
-        return await interaction.response.send_message("Permission denied.", ephemeral=True)
-    await interaction.response.defer(ephemeral=True)
-    if ticket_type.value == "Complaint":
-        await create_ticket_logic(interaction.guild, member, "Complaint", "Staff-initiated complaint.", COMPLAINT_CATEGORY_ID, [SUPERVISOR_ROLE_ID], interaction)
-    else:
-        await create_ticket_logic(interaction.guild, member, ticket_type.value, "Staff-initiated support request.", TICKET_CATEGORY_ID, [STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID], interaction)
 
 @bot.tree.command(name="merge", description="Merge this ticket's history")
 async def merge(interaction: discord.Interaction, target_channel: discord.TextChannel):
