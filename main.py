@@ -87,12 +87,16 @@ MACROS = {
 # --- HELPERS ---
 
 def is_staff_or_higher(interaction: discord.Interaction) -> bool:
-    roles = [STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID, TRIAL_MOD_ROLE_ID]
-    return any(role.id in [r.id for r in interaction.user.roles] for role in roles)
+    if not isinstance(interaction.user, discord.Member):
+        return False
+    staff_roles = {STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID, TRIAL_MOD_ROLE_ID}
+    return any(role.id in staff_roles for role in interaction.user.roles)
 
 def is_lead_or_supervisor(interaction: discord.Interaction) -> bool:
-    roles = [STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID]
-    return any(role.id in [r.id for r in interaction.user.roles] for role in roles)
+    if not isinstance(interaction.user, discord.Member):
+        return False
+    lead_roles = {STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID}
+    return any(role.id in lead_roles for role in interaction.user.roles)
 
 async def create_ticket_logic(guild, member, ticket_type, questions, category_id, interaction: discord.Interaction):
     global AUTO_ASSIGN_ENABLED, ASSIGNMENT_INDEX
@@ -169,7 +173,6 @@ class CloseTicketModal(Modal, title="Close Ticket"):
     reason = TextInput(label="Reason for Closing", placeholder="Provide a reason for the user...", style=discord.TextStyle.paragraph, required=True)
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Immediate response to prevent interaction timeout
         await interaction.response.send_message("Processing ticket closure...", ephemeral=True)
         await close_and_log_ticket(interaction.channel, interaction.user, reason=self.reason.value)
 
@@ -283,7 +286,6 @@ class TicketActionView(View):
     async def close_ticket_button(self, interaction: discord.Interaction, button: Button):
         if not is_staff_or_higher(interaction): 
             return await interaction.response.send_message("Permission denied.", ephemeral=True)
-        # Directly send modal as the interaction response
         await interaction.response.send_modal(CloseTicketModal())
 
 class TicketControlPanelView(View):
@@ -366,22 +368,17 @@ async def merge(interaction: discord.Interaction, target_channel: discord.TextCh
     await interaction.response.send_message(f"Merging content into {target_channel.mention}...")
     
     async for message in interaction.channel.history(limit=100, oldest_first=True):
-        # Skip bot embeds (like the initial ticket message)
         if message.author == bot.user and message.embeds: continue
         
-        # Prepare content
         content = f"**[Merged] {message.author.display_name}:** {message.content}"
         
-        # Handle attachments
         files = []
         for attachment in message.attachments:
-            # Download file into memory
             file_bytes = await attachment.read()
             files.append(discord.File(io.BytesIO(file_bytes), filename=attachment.filename))
         
         if content.strip() or files:
             await target_channel.send(content=content if content.strip() else None, files=files)
-            # Small delay to avoid rate limits during bulk transfer
             await asyncio.sleep(0.5)
 
     await interaction.channel.send("Merge complete. Deleting channel in 5 seconds.")
