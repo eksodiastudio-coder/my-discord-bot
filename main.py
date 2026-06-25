@@ -119,6 +119,19 @@ async def create_ticket_logic(guild, member, ticket_type, questions, category_id
     standard_staff_roles = [TRIAL_MOD_ROLE_ID, STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID]
     supervisor_role = guild.get_role(SUPERVISOR_ROLE_ID)
 
+    assigned_trial = None
+    if AUTO_ASSIGN_ENABLED and ticket_type != "Complaint":
+        trial_role = guild.get_role(TRIAL_MOD_ROLE_ID)
+        inactive_role = guild.get_role(INACTIVITY_ROLE_ID)
+        if trial_role:
+            available_trials = [m for m in trial_role.members if not m.bot and (not inactive_role or inactive_role not in m.roles)]
+            available_trials.sort(key=lambda x: x.id)
+            if available_trials:
+                assigned_trial = available_trials[ASSIGNMENT_INDEX % len(available_trials)]
+                ASSIGNMENT_INDEX += 1
+                # Give assigned trial moderator full claim permissions (read, write, files)
+                overwrites[assigned_trial] = discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True)
+
     if ticket_type == "Complaint":
         for role_id in standard_staff_roles:
             role = guild.get_role(role_id)
@@ -130,20 +143,12 @@ async def create_ticket_logic(guild, member, ticket_type, questions, category_id
         for role_id in all_ids:
             role = guild.get_role(role_id)
             if role:
-                can_talk = (role_id in [STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID]) or (not AUTO_ASSIGN_ENABLED)
+                # If auto-assigned (auto-claimed), standard staff roles cannot speak until claimed
+                if assigned_trial:
+                    can_talk = (role_id in [STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID])
+                else:
+                    can_talk = (role_id in [STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID]) or (not AUTO_ASSIGN_ENABLED)
                 overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=can_talk, attach_files=can_talk)
-
-    assigned_trial = None
-    if AUTO_ASSIGN_ENABLED and ticket_type != "Complaint":
-        trial_role = guild.get_role(TRIAL_MOD_ROLE_ID)
-        inactive_role = guild.get_role(INACTIVITY_ROLE_ID)
-        if trial_role:
-            available_trials = [m for m in trial_role.members if not m.bot and (not inactive_role or inactive_role not in m.roles)]
-            available_trials.sort(key=lambda x: x.id)
-            if available_trials:
-                assigned_trial = available_trials[ASSIGNMENT_INDEX % len(available_trials)]
-                ASSIGNMENT_INDEX += 1
-                overwrites[assigned_trial] = discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True)
 
     channel = await category.create_text_channel(
         name=f"{ticket_type}-{member.name}",
@@ -155,15 +160,15 @@ async def create_ticket_logic(guild, member, ticket_type, questions, category_id
     view = TicketActionView(show_claim=(ticket_type != "Complaint"))
     
     if assigned_trial:
-        embed.add_field(name="Assigned Trial Moderator", value=f"{assigned_trial.mention}\n*Assigned via round-robin.*")
+        embed.add_field(name="Assigned Trial Moderator", value=f"{assigned_trial.mention}\n*Assigned and automatically claimed.*")
         for item in view.children:
             if isinstance(item, Button) and item.custom_id == "claim_ticket":
                 item.disabled = True
-                item.label = f"Assigned: {assigned_trial.display_name}"
+                item.label = f"Claimed by {assigned_trial.display_name}"
 
     await channel.send(embed=embed, view=view)
     if assigned_trial:
-        await channel.send(f"{assigned_trial.mention}, you have been automatically assigned to this ticket.")
+        await channel.send(f"{assigned_trial.mention}, you have been automatically assigned and claimed this ticket.")
 
     await interaction.followup.send(f"Ticket created: {channel.mention}", ephemeral=True)
     return channel
@@ -339,15 +344,20 @@ async def assignoff(interaction: discord.Interaction):
 
 @bot.tree.command(name="removeassign", description="Remove an assigned member from this ticket")
 async def removeassign(interaction: discord.Interaction, member: discord.Member = None):
+    await interaction.response.defer()
+
     if not is_lead_or_supervisor(interaction):
-        return await interaction.response.send_message("Permission denied. Lead/Supervisor only.", ephemeral=True)
+        return await interaction.followup.send("Permission denied. Lead/Supervisor only.", ephemeral=True)
     
     if not interaction.channel.topic or "Ticket for" not in interaction.channel.topic:
-        return await interaction.response.send_message("This command can only be used inside a ticket channel.", ephemeral=True)
+        return await interaction.followup.send("This command can only be used inside a ticket channel.", ephemeral=True)
     
     removed_any = False
     guild = interaction.guild
     trial_role = guild.get_role(TRIAL_MOD_ROLE_ID)
+    staff_role = guild.get_role(STAFF_ROLE_ID)
+    lead_role = guild.get_role(STAFF_LEAD_ROLE_ID)
+    supervisor_role = guild.get_role(SUPERVISOR_ROLE_ID)
     msg_text = ""
     
     if member:
@@ -369,6 +379,16 @@ async def removeassign(interaction: discord.Interaction, member: discord.Member 
             msg_text = "No assigned Trial Moderator with custom permissions found in this channel."
 
     if removed_any:
+        # Revert role permissions back to unclaimed (default) states
+        if staff_role:
+            await interaction.channel.set_permissions(staff_role, read_messages=True, send_messages=not AUTO_ASSIGN_ENABLED, attach_files=not AUTO_ASSIGN_ENABLED)
+        if trial_role:
+            await interaction.channel.set_permissions(trial_role, read_messages=True, send_messages=not AUTO_ASSIGN_ENABLED, attach_files=not AUTO_ASSIGN_ENABLED)
+        if lead_role:
+            await interaction.channel.set_permissions(lead_role, read_messages=True, send_messages=True, attach_files=True)
+        if supervisor_role:
+            await interaction.channel.set_permissions(supervisor_role, read_messages=True, send_messages=True, attach_files=True)
+
         # Scan and update the main bot embed inside the channel to re-enable claiming
         async for msg in interaction.channel.history(limit=30, oldest_first=True):
             if msg.author == bot.user and msg.embeds:
@@ -379,9 +399,9 @@ async def removeassign(interaction: discord.Interaction, member: discord.Member 
                 await msg.edit(embed=embed, view=TicketActionView(show_claim=True))
                 break
                 
-        await interaction.response.send_message(f"✅ {msg_text} Ticket is now open for claiming by standard staff or trial moderators.")
+        await interaction.followup.send(f"✅ {msg_text} Ticket has been unclaimed and is now open for other staff or trial moderators to claim.")
     else:
-        await interaction.response.send_message(msg_text, ephemeral=True)
+        await interaction.followup.send(msg_text)
 
 @bot.tree.command(name="createticket", description="Create a ticket on behalf of a member")
 @app_commands.choices(ticket_type=[
