@@ -527,12 +527,24 @@ async def check_inactive_tickets():
             msgs = [m async for m in channel.history(limit=1)]
             if not msgs: continue
             last_msg = msgs[0]
-            if now - last_msg.created_at > datetime.timedelta(hours=INACTIVITY_CLOSE_AFTER_HOURS):
-                await close_and_log_ticket(channel, bot.user, "Automated closing due to inactivity.")
-            elif now - last_msg.created_at > datetime.timedelta(hours=INACTIVITY_WARN_AFTER_HOURS):
-                if not (last_msg.author == bot.user):
+            
+            # Check if the last message in the channel is the bot's warning message
+            is_warning_msg = (last_msg.author == bot.user and "⚠️ This ticket is inactive" in last_msg.content)
+            
+            if is_warning_msg:
+                # If the warning is already posted, close the ticket once the remaining 24 hours pass
+                time_since_warning = now - last_msg.created_at
+                remaining_hours = INACTIVITY_CLOSE_AFTER_HOURS - INACTIVITY_WARN_AFTER_HOURS  # 48 - 24 = 24 hours
+                if time_since_warning > datetime.timedelta(hours=remaining_hours):
+                    await close_and_log_ticket(channel, bot.user, "Automated closing due to inactivity.")
+            else:
+                # If no warning is posted yet, warn after the initial 24 hours of inactivity
+                time_since_last_msg = now - last_msg.created_at
+                if time_since_last_msg > datetime.timedelta(hours=INACTIVITY_WARN_AFTER_HOURS):
                     await channel.send("⚠️ This ticket is inactive and will be closed automatically in 24 hours.")
-        except: continue
+        except Exception as e: 
+            print(f"Error processing inactivity check for channel {channel.name}: {e}")
+            continue
 
 @bot.event
 async def on_ready():
