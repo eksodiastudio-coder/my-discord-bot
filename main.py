@@ -11,6 +11,10 @@ from flask import Flask
 from threading import Thread
 from discord import app_commands
 
+# --- NEW TRANSLATION IMPORTS ---
+from deep_translator import GoogleTranslator
+from langdetect import detect
+
 # --- KOYEB WEB SERVER SETUP ---
 app = Flask('')
 
@@ -45,6 +49,10 @@ FEEDBACK_LOG_CHANNEL_ID = 1430296240528294049
 TRIAL_MOD_ROLE_ID = 1518663064956702890 
 AUTO_ASSIGN_ENABLED = False 
 ASSIGNMENT_INDEX = 0 
+
+# --- TRANSLATION STATE STORE ---
+# Key: channel_id -> Value: {"member_id": int, "member_lang": str or None}
+ACTIVE_TRANSLATIONS = {}
 
 INACTIVITY_WARN_AFTER_HOURS = 24
 INACTIVITY_CLOSE_AFTER_HOURS = 48
@@ -98,6 +106,16 @@ def is_lead_or_supervisor(interaction: discord.Interaction) -> bool:
     lead_roles = {STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID}
     return any(role.id in lead_roles for role in interaction.user.roles)
 
+async def translate_text(text: str, source: str = 'auto', target: str = 'en') -> str:
+    """Helper to run the Google Translation engine without blocking the bot's execution thread."""
+    try:
+        translator = GoogleTranslator(source=source, target=target)
+        translated = await asyncio.to_thread(translator.translate, text)
+        return translated
+    except Exception as e:
+        print(f"Translation Error: {e}")
+        return text
+
 async def create_ticket_logic(guild, member, ticket_type, questions, category_id, interaction: discord.Interaction):
     global AUTO_ASSIGN_ENABLED, ASSIGNMENT_INDEX
     category = guild.get_channel(category_id)
@@ -129,7 +147,6 @@ async def create_ticket_logic(guild, member, ticket_type, questions, category_id
             if available_trials:
                 assigned_trial = available_trials[ASSIGNMENT_INDEX % len(available_trials)]
                 ASSIGNMENT_INDEX += 1
-                # Give assigned trial moderator full claim permissions (read, write, files)
                 overwrites[assigned_trial] = discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True)
 
     if ticket_type == "Complaint":
@@ -143,7 +160,6 @@ async def create_ticket_logic(guild, member, ticket_type, questions, category_id
         for role_id in all_ids:
             role = guild.get_role(role_id)
             if role:
-                # If auto-assigned (auto-claimed), standard staff roles cannot speak until claimed
                 if assigned_trial:
                     can_talk = (role_id in [STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID])
                 else:
@@ -186,6 +202,10 @@ async def close_and_log_ticket(channel, closer_member, reason="No reason provide
     guild = channel.guild
     log_channel_id = COMPLAINT_LOG_CHANNEL_ID if channel.category_id == COMPLAINT_CATEGORY_ID else LOG_CHANNEL_ID
     log_channel = guild.get_channel(log_channel_id)
+
+    # Clean translation state if present
+    if channel.id in ACTIVE_TRANSLATIONS:
+        ACTIVE_TRANSLATIONS.pop(channel.id, None)
 
     messages = []
     async for message in channel.history(limit=None, oldest_first=True):
@@ -342,6 +362,51 @@ async def assignoff(interaction: discord.Interaction):
     AUTO_ASSIGN_ENABLED = False
     await interaction.response.send_message("❌ **Ticket Auto-Assignment is now OFF.**")
 
+# --- TRANSLATION COMMANDS ---
+
+@bot.tree.command(name="translateon", description="Enable automatic language translation inside this ticket")
+@app_commands.describe(default_language="Optionally specify member language code manually (e.g. 'es' for Spanish, 'fr' for French)")
+async def translateon(interaction: discord.Interaction, default_language: str = None):
+    if not is_staff_or_higher(interaction):
+        return await interaction.response.send_message("Permission denied.", ephemeral=True)
+    
+    # Verify we are in a valid ticket channel setup
+    if not interaction.channel.topic or "Ticket for" not in interaction.channel.topic:
+        return await interaction.response.send_message("This command can only be used inside a ticket channel.", ephemeral=True)
+    
+    # Fetch ticket opener's user ID from channel topic
+    try:
+        owner_id = int(interaction.channel.topic.split("for ")[1].split(" |")[0].strip())
+    except Exception:
+        return await interaction.response.send_message("Could not extract the ticket owner's identity from the channel topic.", ephemeral=True)
+    
+    # Store dynamic translation target data
+    ACTIVE_TRANSLATIONS[interaction.channel.id] = {
+        "member_id": owner_id,
+        "member_lang": default_language.lower() if default_language else None
+    }
+    
+    lang_info = f"'{default_language}'" if default_language else "Auto-Detecting"
+    await interaction.response.send_message(
+        f"🌐 **Translation Services Enabled.**\n"
+        f"- Target member language: `{lang_info}`\n"
+        f"- Submissions from the member will translate to English.\n"
+        f"- Submissions from staff translate to the member's target language."
+    )
+
+@bot.tree.command(name="translateoff", description="Disable automatic language translation inside this ticket")
+async def translateoff(interaction: discord.Interaction):
+    if not is_staff_or_higher(interaction):
+        return await interaction.response.send_message("Permission denied.", ephemeral=True)
+    
+    if interaction.channel.id in ACTIVE_TRANSLATIONS:
+        ACTIVE_TRANSLATIONS.pop(interaction.channel.id, None)
+        await interaction.response.send_message("❌ **Translation Services Disabled.**")
+    else:
+        await interaction.response.send_message("Translation is not active in this channel.", ephemeral=True)
+
+# --- BACKPORTED COMMANDS ---
+
 @bot.tree.command(name="removeassign", description="Remove an assigned member from this ticket")
 async def removeassign(interaction: discord.Interaction, member: discord.Member = None):
     await interaction.response.defer()
@@ -379,7 +444,6 @@ async def removeassign(interaction: discord.Interaction, member: discord.Member 
             msg_text = "No assigned Trial Moderator with custom permissions found in this channel."
 
     if removed_any:
-        # Revert role permissions back to unclaimed (default) states
         if staff_role:
             await interaction.channel.set_permissions(staff_role, read_messages=True, send_messages=not AUTO_ASSIGN_ENABLED, attach_files=not AUTO_ASSIGN_ENABLED)
         if trial_role:
@@ -389,13 +453,10 @@ async def removeassign(interaction: discord.Interaction, member: discord.Member 
         if supervisor_role:
             await interaction.channel.set_permissions(supervisor_role, read_messages=True, send_messages=True, attach_files=True)
 
-        # Scan and update the main bot embed inside the channel to re-enable claiming
         async for msg in interaction.channel.history(limit=30, oldest_first=True):
             if msg.author == bot.user and msg.embeds:
                 embed = msg.embeds[0]
-                embed.clear_fields()  # Remove assignment fields
-                
-                # Edit with active TicketActionView containing the active claim button
+                embed.clear_fields()
                 await msg.edit(embed=embed, view=TicketActionView(show_claim=True))
                 break
                 
@@ -482,6 +543,59 @@ async def on_ready():
         await bot.tree.sync(guild=guild)
     except Exception as e: print(f"SYNC ERROR: {e}")
     if not check_inactive_tickets.is_running(): check_inactive_tickets.start()
+
+# --- NEW TRANSLATION MESSAGE DISPATCHER ---
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    # Process translate conditions
+    if message.channel.id in ACTIVE_TRANSLATIONS:
+        session = ACTIVE_TRANSLATIONS[message.channel.id]
+        member_id = session["member_id"]
+        member_lang = session["member_lang"]
+        content = message.content.strip()
+
+        # Only process if there is readable text inside the message
+        if content:
+            if message.author.id == member_id:
+                # 1. Message is from the Ticket Creator
+                detected_lang = "en"
+                if len(content) > 2:
+                    try:
+                        detected_lang = await asyncio.to_thread(detect, content)
+                    except Exception:
+                        detected_lang = "en"
+
+                # Update target language session if language changed/detected
+                if detected_lang != "en":
+                    session["member_lang"] = detected_lang
+                    
+                    translated = await translate_text(content, source=detected_lang, target="en")
+                    if translated and translated.lower() != content.lower():
+                        embed = discord.Embed(
+                            title="🌐 Translation to English",
+                            description=translated,
+                            color=discord.Color.blue()
+                        )
+                        embed.set_footer(text=f"Detected: {detected_lang.upper()} | Auto-Translation active")
+                        await message.channel.send(embed=embed)
+            else:
+                # 2. Message is from a staff member / other user
+                # Translate staff message into the member's target language (if set and not English)
+                if member_lang and member_lang != "en":
+                    translated = await translate_text(content, source="en", target=member_lang)
+                    if translated and translated.lower() != content.lower():
+                        embed = discord.Embed(
+                            title=f"🌐 Translation to {member_lang.upper()}",
+                            description=translated,
+                            color=discord.Color.green()
+                        )
+                        embed.set_footer(text="Translated automatically for the user")
+                        await message.channel.send(embed=embed)
+
+    await bot.process_commands(message)
 
 if __name__ == "__main__":
     keep_alive()
