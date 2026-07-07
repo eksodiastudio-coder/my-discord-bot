@@ -544,7 +544,7 @@ async def on_ready():
     except Exception as e: print(f"SYNC ERROR: {e}")
     if not check_inactive_tickets.is_running(): check_inactive_tickets.start()
 
-# --- NEW TRANSLATION MESSAGE DISPATCHER ---
+# --- UPDATED TRANSLATION MESSAGE DISPATCHER ---
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -561,29 +561,41 @@ async def on_message(message: discord.Message):
         if content:
             if message.author.id == member_id:
                 # 1. Message is from the Ticket Creator
-                detected_lang = "en"
-                if len(content) > 2:
-                    try:
-                        detected_lang = await asyncio.to_thread(detect, content)
-                    except Exception:
-                        detected_lang = "en"
+                try:
+                    detected_lang = await asyncio.to_thread(detect, content)
+                except Exception:
+                    detected_lang = "en"
 
-                # Update target language session if language changed/detected
-                if detected_lang != "en":
-                    session["member_lang"] = detected_lang
-                    
-                    translated = await translate_text(content, source=detected_lang, target="en")
-                    if translated and translated.lower() != content.lower():
-                        embed = discord.Embed(
-                            title="🌐 Translation to English",
-                            description=translated,
-                            color=discord.Color.blue()
-                        )
-                        embed.set_footer(text=f"Detected: {detected_lang.upper()} | Auto-Translation active")
-                        await message.channel.send(embed=embed)
+                if member_lang is not None:
+                    # Language is already locked. Only translate if it matches the locked language.
+                    if detected_lang == member_lang:
+                        translated = await translate_text(content, source=detected_lang, target="en")
+                        if translated and translated.lower() != content.lower():
+                            embed = discord.Embed(
+                                title="🌐 Translation to English",
+                                description=translated,
+                                color=discord.Color.blue()
+                            )
+                            embed.set_footer(text=f"Language: {detected_lang.upper()} (Locked) | Auto-Translation")
+                            await message.channel.send(embed=embed)
+                    # If detected_lang != member_lang, the bot simply does not translate (ignored)
+                else:
+                    # No language is locked yet. If they speak non-English, lock it in now.
+                    if detected_lang != "en":
+                        session["member_lang"] = detected_lang  # LOCKS the language
+                        
+                        translated = await translate_text(content, source=detected_lang, target="en")
+                        if translated and translated.lower() != content.lower():
+                            embed = discord.Embed(
+                                title="🌐 Translation to English",
+                                description=translated,
+                                color=discord.Color.blue()
+                            )
+                            embed.set_footer(text=f"Detected & Locked: {detected_lang.upper()}")
+                            await message.channel.send(embed=embed)
             else:
                 # 2. Message is from a staff member / other user
-                # Translate staff message into the member's target language (if set and not English)
+                # Only translate if a non-English language has been locked in
                 if member_lang and member_lang != "en":
                     translated = await translate_text(content, source="en", target=member_lang)
                     if translated and translated.lower() != content.lower():
