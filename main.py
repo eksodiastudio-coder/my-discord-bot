@@ -531,9 +531,30 @@ async def createticket(interaction: discord.Interaction, ticket_type: app_comman
 @bot.tree.command(name="setup_tickets", description="Setup the ticket support panel")
 @app_commands.default_permissions(administrator=True)
 async def setup_tickets(interaction: discord.Interaction):
-    embed = discord.Embed(title="Support Center", description="Select a category below to open a ticket.", color=discord.Color.blue())
+    embed = discord.Embed(
+        title="Support Center",
+        description="Please select the appropriate category for your support request below. A private channel will be opened for you to speak with our team.",
+        color=discord.Color.blue()
+    )
+    embed.add_field(
+        name="🖥️ Server Support",
+        value="For issues related to the server (mutes, warning, ban or reporting a member).",
+        inline=False
+    )
+    embed.add_field(
+        name="🎮 Game Support",
+        value="For appealing ban, reporting glitch abusers/hackers, or issues related to the game.",
+        inline=False
+    )
+    embed.add_field(
+        name="⚖️ File a Complaint",
+        value="*Supervisor-Only:* Use this to file a formal complaint against a staff member.",
+        inline=False
+    )
+    
     await interaction.channel.send(embed=embed, view=TicketControlPanelView())
     await interaction.response.send_message("✅ Panel posted!", ephemeral=True)
+
 
 @bot.tree.command(name="merge", description="Merge this ticket's history including images")
 async def merge(interaction: discord.Interaction, target_channel: discord.TextChannel):
