@@ -832,6 +832,7 @@ async def on_message(message: discord.Message):
             attachments = [att.url for att in message.attachments]
             asyncio.create_task(send_to_nextjs("/api/support/sync/message", {
                 "channelId": str(message.channel.id),
+                "messageId": str(message.id),
                 "senderId": str(message.author.id),
                 "senderName": message.author.display_name,
                 "senderAvatar": str(message.author.display_avatar.url) if message.author.display_avatar else "",
