@@ -387,6 +387,128 @@ def http_claim_ticket():
     asyncio.run_coroutine_threadsafe(claim_ticket_from_web(channel_id, staff_name, staff_id), bot.loop)
     return jsonify({"success": True}), 200
 
+# NEW: Web-to-Bot Command Execution Endpoint
+async def execute_web_command(channel_id: int, command: str, args: dict, staff_name: str):
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except Exception as e:
+            print(f"[Web Command Error] Channel {channel_id} not found: {e}")
+            return {"error": "Channel not found"}
+
+    # 1. TRANSLATION ON
+    if command == "translateon":
+        lang = args.get("lang") or None
+        owner_id = None
+        if channel.topic and "Ticket for" in channel.topic:
+            try:
+                owner_id = int(channel.topic.split("for ")[1].split(" |")[0].strip())
+            except Exception:
+                pass
+        
+        ACTIVE_TRANSLATIONS[channel.id] = {
+            "member_id": owner_id,
+            "member_lang": lang.lower() if lang else None
+        }
+        lang_info = f"`{lang}`" if lang else "Auto-Detecting"
+        await channel.send(
+            f"🌐 **Translation Enabled by {staff_name} (via Web Dashboard)**\n"
+            f"- Target language: {lang_info}\n"
+            f"- Member messages will translate to English.\n"
+            f"- Staff messages will translate to member's language."
+        )
+        return {"success": True, "message": f"Translation turned on ({lang_info})"}
+
+    # 2. TRANSLATION OFF
+    elif command == "translateoff":
+        if channel.id in ACTIVE_TRANSLATIONS:
+            ACTIVE_TRANSLATIONS.pop(channel.id, None)
+            await channel.send(f"❌ **Translation Disabled by {staff_name} (via Web Dashboard)**")
+            return {"success": True, "message": "Translation turned off"}
+        return {"success": True, "message": "Translation was not active"}
+
+    # 3. UNASSIGN / REMOVE ASSIGNMENT
+    elif command == "removeassign":
+        staff_role = channel.guild.get_role(STAFF_ROLE_ID)
+        trial_role = channel.guild.get_role(TRIAL_MOD_ROLE_ID)
+        lead_role = channel.guild.get_role(STAFF_LEAD_ROLE_ID)
+        supervisor_role = channel.guild.get_role(SUPERVISOR_ROLE_ID)
+
+        for target in list(channel.overwrites.keys()):
+            if isinstance(target, discord.Member) and trial_role and trial_role in target.roles:
+                await channel.set_permissions(target, overwrite=None)
+
+        if staff_role: await channel.set_permissions(staff_role, read_messages=True, send_messages=True, attach_files=True)
+        if trial_role: await channel.set_permissions(trial_role, read_messages=True, send_messages=True, attach_files=True)
+        if lead_role: await channel.set_permissions(lead_role, read_messages=True, send_messages=True, attach_files=True)
+        if supervisor_role: await channel.set_permissions(supervisor_role, read_messages=True, send_messages=True, attach_files=True)
+
+        async for msg in channel.history(limit=30, oldest_first=True):
+            if msg.author == bot.user and msg.embeds:
+                embed = msg.embeds[0]
+                embed.clear_fields()
+                await msg.edit(embed=embed, view=TicketActionView(show_claim=True))
+                break
+
+        await channel.send(f"🔓 **Assignment removed by {staff_name} (via Web Dashboard)**. Ticket is open for any staff to claim.")
+        return {"success": True, "message": "Ticket assignment removed and reopened"}
+
+    # 4. MERGE TICKET
+    elif command == "merge":
+        target_channel_id = int(args.get("targetChannelId", 0))
+        target_channel = channel.guild.get_channel(target_channel_id)
+        if not target_channel:
+            return {"error": "Target merge channel not found."}
+
+        await target_channel.send(f"📥 **Merging messages from #{channel.name} (Triggered by {staff_name} via Web)...**")
+
+        async for message in channel.history(limit=100, oldest_first=True):
+            if message.author == bot.user and message.embeds: continue
+            content = f"**[Merged] {message.author.display_name}:** {message.content}"
+            files = []
+            for attachment in message.attachments:
+                file_bytes = await attachment.read()
+                files.append(discord.File(io.BytesIO(file_bytes), filename=attachment.filename))
+            if content.strip() or files:
+                await target_channel.send(content=content if content.strip() else None, files=files)
+                await asyncio.sleep(0.4)
+
+        await channel.send(f"⚠️ Merge complete into {target_channel.mention}. Deleting channel in 5 seconds...")
+        await asyncio.sleep(5)
+        await channel.delete()
+        return {"success": True, "message": "Ticket successfully merged and deleted."}
+
+    # 5. SEND MACRO TEMPLATE
+    elif command == "macro":
+        macro_key = args.get("macroKey")
+        macro_text = MACROS.get(macro_key)
+        if macro_text:
+            await channel.send(f"**[Staff - {staff_name}]:**\n{macro_text}")
+            return {"success": True, "message": f"Macro '{macro_key}' sent"}
+        return {"error": "Macro not found"}
+
+    return {"error": "Unknown command"}
+
+@app.route('/api/command', methods=['POST'])
+def http_run_command():
+    secret = request.headers.get("x-web-sync-secret")
+    if secret != WEB_SYNC_SECRET:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    data = request.json or {}
+    channel_id = int(data.get("channelId", 0))
+    command = data.get("command", "")
+    args = data.get("args", {})
+    staff_name = data.get("staffName", "Staff Member")
+
+    future = asyncio.run_coroutine_threadsafe(
+        execute_web_command(channel_id, command, args, staff_name), 
+        bot.loop
+    )
+    result = future.result(timeout=15)
+    return jsonify(result), (200 if "success" in result else 400)
+
 def run_web_server():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
