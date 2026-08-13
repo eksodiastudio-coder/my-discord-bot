@@ -335,7 +335,7 @@ async def claim_ticket_from_web(channel_id: int, staff_name: str, staff_id: str 
     if lead_role: await channel.set_permissions(lead_role, read_messages=True, send_messages=True)
     if supervisor_role: await channel.set_permissions(supervisor_role, read_messages=True, send_messages=True)
 
-    # Grant channel permissions directly to claiming staff member on Discord
+    # Grant direct permissions to claiming staff member on Discord
     if staff_id:
         try:
             member = await channel.guild.fetch_member(int(staff_id))
@@ -343,6 +343,20 @@ async def claim_ticket_from_web(channel_id: int, staff_name: str, staff_id: str 
                 await channel.set_permissions(member, read_messages=True, send_messages=True, attach_files=True)
         except Exception as e:
             print(f"[Web Claim Warning] Could not set member permissions for {staff_id}: {e}")
+
+    # Search for the initial ticket embed message in Discord and disable the Claim button
+    try:
+        async for msg in channel.history(limit=10, oldest_first=True):
+            if msg.author == bot.user and msg.components:
+                view = View.from_message(msg)
+                for item in view.children:
+                    if isinstance(item, Button) and item.custom_id == "claim_ticket":
+                        item.disabled = True
+                        item.label = f"Claimed by {staff_name}"
+                await msg.edit(view=view)
+                break
+    except Exception as e:
+        print(f"[Web Claim Error] Could not update claim button in channel {channel_id}: {e}")
 
     await channel.send(f"🙋 Ticket claimed via Web Dashboard by **{staff_name}**.")
 
