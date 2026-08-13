@@ -11,7 +11,7 @@ from flask import Flask
 from threading import Thread
 from discord import app_commands
 
-# --- NEW TRANSLATION IMPORTS ---
+# --- TRANSLATION IMPORTS ---
 from deep_translator import GoogleTranslator
 from langdetect import detect
 
@@ -20,7 +20,7 @@ app = Flask('')
 
 @app.route('/')
 def home():
-    return "Ticket Bot is Online!"
+    return "Ticket Bot & Web Sync Engine is Online!"
 
 def run_web_server():
     port = int(os.environ.get("PORT", 8080))
@@ -45,13 +45,16 @@ COMPLAINT_CATEGORY_ID = 1428497122759671881
 COMPLAINT_LOG_CHANNEL_ID = 1428499253952774176
 FEEDBACK_LOG_CHANNEL_ID = 1430296240528294049 
 
+# --- NEXT.JS WEB PORTAL SYNC CONFIG ---
+NEXTJS_SYNC_URL = os.getenv("NEXTJS_SYNC_URL", "http://localhost:3000")
+WEB_SYNC_SECRET = os.getenv("WEB_SYNC_SECRET", "my_super_secret_key_123")
+
 # --- AUTO-ASSIGNMENT CONFIG ---
 TRIAL_MOD_ROLE_ID = 1518663064956702890 
 AUTO_ASSIGN_ENABLED = False 
 ASSIGNMENT_INDEX = 0 
 
 # --- TRANSLATION STATE STORE ---
-# Key: channel_id -> Value: {"member_id": int, "member_lang": str or None}
 ACTIVE_TRANSLATIONS = {}
 
 INACTIVITY_WARN_AFTER_HOURS = 24
@@ -92,6 +95,25 @@ MACROS = {
     "closing": "Is there anything else I can help with before closing?" 
 }
 
+# --- NEXT.JS SYNC HELPER ---
+
+async def send_to_nextjs(endpoint: str, data: dict):
+    """Sends synced ticket/message data to the Next.js Web Portal API."""
+    if not NEXTJS_SYNC_URL:
+        return
+    url = f"{NEXTJS_SYNC_URL.rstrip('/')}{endpoint}"
+    headers = {
+        "Content-Type": "application/json",
+        "x-web-sync-secret": WEB_SYNC_SECRET
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=data, headers=headers) as resp:
+                if resp.status != 200:
+                    print(f"[Web Sync Error] Next.js returned status {resp.status} for {endpoint}")
+    except Exception as e:
+        print(f"[Web Sync Exception] Could not reach Next.js server: {e}")
+
 # --- HELPERS ---
 
 def is_staff_or_higher(interaction: discord.Interaction) -> bool:
@@ -99,6 +121,12 @@ def is_staff_or_higher(interaction: discord.Interaction) -> bool:
         return False
     staff_roles = {STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID, TRIAL_MOD_ROLE_ID}
     return any(role.id in staff_roles for role in interaction.user.roles)
+
+def is_staff_or_higher_user(user: discord.User | discord.Member) -> bool:
+    if not isinstance(user, discord.Member):
+        return False
+    staff_roles = {STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID, TRIAL_MOD_ROLE_ID}
+    return any(role.id in staff_roles for role in user.roles)
 
 def is_lead_or_supervisor(interaction: discord.Interaction) -> bool:
     if not isinstance(interaction.user, discord.Member):
@@ -167,7 +195,7 @@ async def create_ticket_logic(guild, member, ticket_type, questions, category_id
                 overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=can_talk, attach_files=can_talk)
 
     channel = await category.create_text_channel(
-        name=f"{ticket_type}-{member.name}",
+        name=f"{ticket_type.lower()}-{member.name}",
         overwrites=overwrites,
         topic=f"Ticket for {member.id} | ID: {ticket_id}"
     )
@@ -186,6 +214,18 @@ async def create_ticket_logic(guild, member, ticket_type, questions, category_id
     if assigned_trial:
         await channel.send(f"{assigned_trial.mention}, you have been automatically assigned and claimed this ticket.")
 
+    # --- NEXT.JS WEB PORTAL SYNC TRIGGER ---
+    asyncio.create_task(send_to_nextjs("/api/support/sync/ticket", {
+        "ticketId": ticket_id,
+        "channelId": str(channel.id),
+        "discordUserId": str(member.id),
+        "userName": member.display_name,
+        "userAvatar": member.display_avatar.url if member.display_avatar else "",
+        "ticketType": ticket_type,
+        "subject": f"{ticket_type} Support Request"
+    }))
+    # ---------------------------------------
+
     await interaction.followup.send(f"Ticket created: {channel.mention}", ephemeral=True)
     return channel
 
@@ -203,7 +243,6 @@ async def close_and_log_ticket(channel, closer_member, reason="No reason provide
     log_channel_id = COMPLAINT_LOG_CHANNEL_ID if channel.category_id == COMPLAINT_CATEGORY_ID else LOG_CHANNEL_ID
     log_channel = guild.get_channel(log_channel_id)
 
-    # Clean translation state if present
     if channel.id in ACTIVE_TRANSLATIONS:
         ACTIVE_TRANSLATIONS.pop(channel.id, None)
 
@@ -370,17 +409,14 @@ async def translateon(interaction: discord.Interaction, default_language: str = 
     if not is_staff_or_higher(interaction):
         return await interaction.response.send_message("Permission denied.", ephemeral=True)
     
-    # Verify we are in a valid ticket channel setup
     if not interaction.channel.topic or "Ticket for" not in interaction.channel.topic:
         return await interaction.response.send_message("This command can only be used inside a ticket channel.", ephemeral=True)
     
-    # Fetch ticket opener's user ID from channel topic
     try:
         owner_id = int(interaction.channel.topic.split("for ")[1].split(" |")[0].strip())
     except Exception:
         return await interaction.response.send_message("Could not extract the ticket owner's identity from the channel topic.", ephemeral=True)
     
-    # Store dynamic translation target data
     ACTIVE_TRANSLATIONS[interaction.channel.id] = {
         "member_id": owner_id,
         "member_lang": default_language.lower() if default_language else None
@@ -528,17 +564,14 @@ async def check_inactive_tickets():
             if not msgs: continue
             last_msg = msgs[0]
             
-            # Check if the last message in the channel is the bot's warning message
             is_warning_msg = (last_msg.author == bot.user and "⚠️ This ticket is inactive" in last_msg.content)
             
             if is_warning_msg:
-                # If the warning is already posted, close the ticket once the remaining 24 hours pass
                 time_since_warning = now - last_msg.created_at
-                remaining_hours = INACTIVITY_CLOSE_AFTER_HOURS - INACTIVITY_WARN_AFTER_HOURS  # 48 - 24 = 24 hours
+                remaining_hours = INACTIVITY_CLOSE_AFTER_HOURS - INACTIVITY_WARN_AFTER_HOURS
                 if time_since_warning > datetime.timedelta(hours=remaining_hours):
                     await close_and_log_ticket(channel, bot.user, "Automated closing due to inactivity.")
             else:
-                # If no warning is posted yet, warn after the initial 24 hours of inactivity
                 time_since_last_msg = now - last_msg.created_at
                 if time_since_last_msg > datetime.timedelta(hours=INACTIVITY_WARN_AFTER_HOURS):
                     await channel.send("⚠️ This ticket is inactive and will be closed automatically in 24 hours.")
@@ -556,30 +589,40 @@ async def on_ready():
     except Exception as e: print(f"SYNC ERROR: {e}")
     if not check_inactive_tickets.is_running(): check_inactive_tickets.start()
 
-# --- UPDATED TRANSLATION MESSAGE DISPATCHER ---
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # Process translate conditions
+    # --- NEXT.JS MESSAGE SYNC TRIGGER ---
+    if message.channel.category_id in [TICKET_CATEGORY_ID, COMPLAINT_CATEGORY_ID]:
+        attachments = [att.url for att in message.attachments]
+        asyncio.create_task(send_to_nextjs("/api/support/sync/message", {
+            "channelId": str(message.channel.id),
+            "senderId": str(message.author.id),
+            "senderName": message.author.display_name,
+            "senderAvatar": message.author.display_avatar.url if message.author.display_avatar else "",
+            "content": message.content,
+            "attachments": attachments,
+            "isStaff": is_staff_or_higher_user(message.author)
+        }))
+    # ------------------------------------
+
+    # Process translation conditions
     if message.channel.id in ACTIVE_TRANSLATIONS:
         session = ACTIVE_TRANSLATIONS[message.channel.id]
         member_id = session["member_id"]
         member_lang = session["member_lang"]
         content = message.content.strip()
 
-        # Only process if there is readable text inside the message
         if content:
             if message.author.id == member_id:
-                # 1. Message is from the Ticket Creator
                 try:
                     detected_lang = await asyncio.to_thread(detect, content)
                 except Exception:
                     detected_lang = "en"
 
                 if member_lang is not None:
-                    # Language is already locked. Only translate if it matches the locked language.
                     if detected_lang == member_lang:
                         translated = await translate_text(content, source=detected_lang, target="en")
                         if translated and translated.lower() != content.lower():
@@ -590,12 +633,9 @@ async def on_message(message: discord.Message):
                             )
                             embed.set_footer(text=f"Language: {detected_lang.upper()} (Locked) | Auto-Translation")
                             await message.channel.send(embed=embed)
-                    # If detected_lang != member_lang, the bot simply does not translate (ignored)
                 else:
-                    # No language is locked yet. If they speak non-English, lock it in now.
                     if detected_lang != "en":
-                        session["member_lang"] = detected_lang  # LOCKS the language
-                        
+                        session["member_lang"] = detected_lang
                         translated = await translate_text(content, source=detected_lang, target="en")
                         if translated and translated.lower() != content.lower():
                             embed = discord.Embed(
@@ -606,8 +646,6 @@ async def on_message(message: discord.Message):
                             embed.set_footer(text=f"Detected & Locked: {detected_lang.upper()}")
                             await message.channel.send(embed=embed)
             else:
-                # 2. Message is from a staff member / other user
-                # Only translate if a non-English language has been locked in
                 if member_lang and member_lang != "en":
                     translated = await translate_text(content, source="en", target=member_lang)
                     if translated and translated.lower() != content.lower():
