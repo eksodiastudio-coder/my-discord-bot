@@ -683,10 +683,19 @@ async def on_ready():
     print(f"--- BOT IS ONLINE AS {bot.user.name} ---")
     try:
         guild = discord.Object(id=GUILD_ID)
+        # Clear global commands from the tree before syncing to the guild
+        bot.tree.clear_commands(guild=None)
+        await bot.tree.sync()
+        
+        # Sync directly to your guild
         bot.tree.copy_global_to(guild=guild)
         await bot.tree.sync(guild=guild)
-    except Exception as e: print(f"SYNC ERROR: {e}")
-    if not check_inactive_tickets.is_running(): check_inactive_tickets.start()
+        print("✅ Commands synced successfully!")
+    except Exception as e:
+        print(f"SYNC ERROR: {e}")
+        
+    if not check_inactive_tickets.is_running():
+        check_inactive_tickets.start()
 
 @bot.event
 async def on_message(message: discord.Message):
