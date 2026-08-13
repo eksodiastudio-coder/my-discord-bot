@@ -258,6 +258,11 @@ async def close_and_log_ticket(channel, closer_member, reason="No reason provide
     log_channel_id = COMPLAINT_LOG_CHANNEL_ID if channel.category_id == COMPLAINT_CATEGORY_ID else LOG_CHANNEL_ID
     log_channel = guild.get_channel(log_channel_id)
 
+    # --- SYNC CLOSE TO NEXT.JS WEB PORTAL ---
+    asyncio.create_task(send_to_nextjs("/api/support/sync/close", {
+        "channelId": str(channel.id)
+    }))
+
     if channel.id in ACTIVE_TRANSLATIONS:
         ACTIVE_TRANSLATIONS.pop(channel.id, None)
 
@@ -305,17 +310,19 @@ async def close_ticket_from_web(channel_id: int, staff_name: str, reason: str = 
     if not channel:
         try:
             channel = await bot.fetch_channel(channel_id)
-        except Exception:
+        except Exception as e:
+            print(f"[Web Close Error] Could not find channel {channel_id}: {e}")
             return
     mock_closer = MockMember(staff_name)
     await close_and_log_ticket(channel, mock_closer, reason)
 
-async def claim_ticket_from_web(channel_id: int, staff_name: str):
+async def claim_ticket_from_web(channel_id: int, staff_name: str, staff_id: str = None):
     channel = bot.get_channel(channel_id)
     if not channel:
         try:
             channel = await bot.fetch_channel(channel_id)
-        except Exception:
+        except Exception as e:
+            print(f"[Web Claim Error] Could not find channel {channel_id}: {e}")
             return
     
     staff_role = channel.guild.get_role(STAFF_ROLE_ID)
@@ -328,13 +335,18 @@ async def claim_ticket_from_web(channel_id: int, staff_name: str):
     if lead_role: await channel.set_permissions(lead_role, read_messages=True, send_messages=True)
     if supervisor_role: await channel.set_permissions(supervisor_role, read_messages=True, send_messages=True)
 
+    # Grant channel permissions directly to claiming staff member on Discord
+    if staff_id:
+        try:
+            member = await channel.guild.fetch_member(int(staff_id))
+            if member:
+                await channel.set_permissions(member, read_messages=True, send_messages=True, attach_files=True)
+        except Exception as e:
+            print(f"[Web Claim Warning] Could not set member permissions for {staff_id}: {e}")
+
     await channel.send(f"🙋 Ticket claimed via Web Dashboard by **{staff_name}**.")
 
-# --- FLASK ENDPOINTS FOR WEB DASHBOARD SYNC ---
-@app.route('/')
-def home():
-    return "Ticket Bot & Web Sync Engine is Online!"
-
+# --- FLASK ENDPOINTS ---
 @app.route('/api/close-ticket', methods=['POST'])
 def http_close_ticket():
     secret = request.headers.get("x-web-sync-secret")
@@ -356,8 +368,9 @@ def http_claim_ticket():
     data = request.json or {}
     channel_id = int(data.get("channelId", 0))
     staff_name = data.get("staffName", "Staff Member")
+    staff_id = data.get("staffDiscordId", None)
     
-    asyncio.run_coroutine_threadsafe(claim_ticket_from_web(channel_id, staff_name), bot.loop)
+    asyncio.run_coroutine_threadsafe(claim_ticket_from_web(channel_id, staff_name, staff_id), bot.loop)
     return jsonify({"success": True}), 200
 
 def run_web_server():
