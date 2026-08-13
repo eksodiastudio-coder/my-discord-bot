@@ -407,6 +407,16 @@ class FeedbackRatingView(View):
         for item in self.children: item.disabled = True
         await interaction.response.edit_message(content=f"Thank you! You rated this **{rating}/5 stars**.", view=self)
         
+        staff_name = self.closer_mention.replace("@", "").replace("**", "")
+
+        # SYNC MEMBER FEEDBACK TO NEXTJS WEBSITE DATABASE
+        asyncio.create_task(send_to_nextjs("/api/support/sync/feedback", {
+            "ticketId": self.ticket_id,
+            "rating": rating,
+            "staffName": staff_name,
+            "submitterName": interaction.user.display_name,
+        }))
+
         feedback_channel = interaction.client.get_channel(FEEDBACK_LOG_CHANNEL_ID)
         if feedback_channel:
             embed = discord.Embed(title="New Support Feedback", color=discord.Color.gold())
