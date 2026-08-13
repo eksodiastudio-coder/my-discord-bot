@@ -730,73 +730,104 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot:
+    # Detect if this is a staff reply sent from the Web Dashboard via bot API
+    is_web_staff_reply = (message.author == bot.user and message.content.startswith("**[Staff - "))
+
+    # Ignore other bots and standard bot messages to prevent infinite loops
+    if message.author.bot and not is_web_staff_reply:
+        # Check if this is a bot translation embed that should sync to Next.js Web Portal
+        if message.channel.category_id in [TICKET_CATEGORY_ID, COMPLAINT_CATEGORY_ID]:
+            if message.embeds:
+                embed_title = message.embeds[0].title or ""
+                if "Translation to English" in embed_title:
+                    asyncio.create_task(send_to_nextjs("/api/support/sync/message", {
+                        "channelId": str(message.channel.id),
+                        "senderId": str(bot.user.id),
+                        "senderName": "Translation Engine 🌐",
+                        "senderAvatar": str(bot.user.display_avatar.url) if bot.user.display_avatar else "",
+                        "content": f"*[Translated to English]:* {message.embeds[0].description}",
+                        "attachments": [],
+                        "isStaff": True
+                    }))
+        await bot.process_commands(message)
         return
 
-    # --- NEXT.JS MESSAGE SYNC TRIGGER ---
-    if message.channel.category_id in [TICKET_CATEGORY_ID, COMPLAINT_CATEGORY_ID]:
-        attachments = [att.url for att in message.attachments]
-        asyncio.create_task(send_to_nextjs("/api/support/sync/message", {
-            "channelId": str(message.channel.id),
-            "senderId": str(message.author.id),
-            "senderName": message.author.display_name,
-            "senderAvatar": str(message.author.display_avatar.url) if message.author.display_avatar else "",
-            "content": message.content,
-            "attachments": attachments,
-            "isStaff": is_staff_or_higher_user(message.author)
-        }))
+    # Extract clean text content (strip the **[Staff - Name]:** prefix for web replies)
+    if is_web_staff_reply:
+        try:
+            content = message.content.split("]:** ", 1)[1].strip()
+        except IndexError:
+            content = message.content.strip()
+    else:
+        content = message.content.strip()
 
-    # Process translation conditions
-    if message.channel.id in ACTIVE_TRANSLATIONS:
+    # Process automatic language translation if active in this ticket
+    if message.channel.id in ACTIVE_TRANSLATIONS and content:
         session = ACTIVE_TRANSLATIONS[message.channel.id]
         member_id = session["member_id"]
         member_lang = session["member_lang"]
-        content = message.content.strip()
 
-        if content:
-            if message.author.id == member_id:
-                try:
-                    detected_lang = await asyncio.to_thread(detect, content)
-                except Exception:
-                    detected_lang = "en"
+        # Case A: Message sent by Ticket User -> Translate to English
+        if not message.author.bot and message.author.id == member_id:
+            try:
+                detected_lang = await asyncio.to_thread(detect, content)
+            except Exception:
+                detected_lang = "en"
 
-                if member_lang is not None:
-                    if detected_lang == member_lang:
-                        translated = await translate_text(content, source=detected_lang, target="en")
-                        if translated and translated.lower() != content.lower():
-                            embed = discord.Embed(
-                                title="🌐 Translation to English",
-                                description=translated,
-                                color=discord.Color.blue()
-                            )
-                            embed.set_footer(text=f"Language: {detected_lang.upper()} (Locked) | Auto-Translation")
-                            await message.channel.send(embed=embed)
-                else:
-                    if detected_lang != "en":
-                        session["member_lang"] = detected_lang
-                        translated = await translate_text(content, source=detected_lang, target="en")
-                        if translated and translated.lower() != content.lower():
-                            embed = discord.Embed(
-                                title="🌐 Translation to English",
-                                description=translated,
-                                color=discord.Color.blue()
-                            )
-                            embed.set_footer(text=f"Detected & Locked: {detected_lang.upper()}")
-                            await message.channel.send(embed=embed)
-            else:
-                if member_lang and member_lang != "en":
-                    translated = await translate_text(content, source="en", target=member_lang)
+            if member_lang is not None:
+                if detected_lang == member_lang or detected_lang != "en":
+                    translated = await translate_text(content, source=detected_lang, target="en")
                     if translated and translated.lower() != content.lower():
                         embed = discord.Embed(
-                            title=f"🌐 Translation to {member_lang.upper()}",
+                            title="🌐 Translation to English",
                             description=translated,
-                            color=discord.Color.green()
+                            color=discord.Color.blue()
                         )
-                        embed.set_footer(text="Translated automatically for the user")
+                        embed.set_footer(text=f"Language: {detected_lang.upper()} | Auto-Translation")
+                        await message.channel.send(embed=embed)
+            else:
+                if detected_lang != "en":
+                    session["member_lang"] = detected_lang
+                    translated = await translate_text(content, source=detected_lang, target="en")
+                    if translated and translated.lower() != content.lower():
+                        embed = discord.Embed(
+                            title="🌐 Translation to English",
+                            description=translated,
+                            color=discord.Color.blue()
+                        )
+                        embed.set_footer(text=f"Detected & Locked: {detected_lang.upper()}")
                         await message.channel.send(embed=embed)
 
-    await bot.process_commands(message)
+        # Case B: Message sent by Staff (via Web Dashboard OR Discord) -> Translate to User's Language
+        elif is_web_staff_reply or (not message.author.bot and message.author.id != member_id):
+            if member_lang and member_lang != "en":
+                translated = await translate_text(content, source="en", target=member_lang)
+                if translated and translated.lower() != content.lower():
+                    embed = discord.Embed(
+                        title=f"🌐 Translation to {member_lang.upper()}",
+                        description=translated,
+                        color=discord.Color.green()
+                    )
+                    embed.set_footer(text="Translated automatically for the user")
+                    await message.channel.send(embed=embed)
 
+    # Next.js Web Message Sync Trigger
+    if message.channel.category_id in [TICKET_CATEGORY_ID, COMPLAINT_CATEGORY_ID]:
+        # Web staff replies are already saved in Next.js store, so avoid double-syncing them
+        if not is_web_staff_reply:
+            attachments = [att.url for att in message.attachments]
+            asyncio.create_task(send_to_nextjs("/api/support/sync/message", {
+                "channelId": str(message.channel.id),
+                "senderId": str(message.author.id),
+                "senderName": message.author.display_name,
+                "senderAvatar": str(message.author.display_avatar.url) if message.author.display_avatar else "",
+                "content": message.content,
+                "attachments": attachments,
+                "isStaff": is_staff_or_higher_user(message.author)
+            }))
+
+    await bot.process_commands(message)
+    
 if __name__ == "__main__":
     keep_alive()
     if BOT_TOKEN: bot.run(BOT_TOKEN)
