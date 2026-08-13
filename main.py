@@ -428,7 +428,7 @@ async def execute_web_command(channel_id: int, command: str, args: dict, staff_n
             return {"success": True, "message": "Translation turned off"}
         return {"success": True, "message": "Translation was not active"}
 
-    # 3. UNASSIGN / REMOVE ASSIGNMENT
+    # 3. UNASSIGN / REMOVE ASSIGNMENT (HR / Management Only)
     elif command == "removeassign":
         staff_role = channel.guild.get_role(STAFF_ROLE_ID)
         trial_role = channel.guild.get_role(TRIAL_MOD_ROLE_ID)
@@ -454,7 +454,55 @@ async def execute_web_command(channel_id: int, command: str, args: dict, staff_n
         await channel.send(f"🔓 **Assignment removed by {staff_name} (via Web Dashboard)**. Ticket is open for any staff to claim.")
         return {"success": True, "message": "Ticket assignment removed and reopened"}
 
-    # 4. MERGE TICKET
+    # 4. MERGE TO COMPLAINT TICKET (HR ONLY)
+    elif command == "merge_complaint":
+        guild = channel.guild
+        owner_id = None
+        if channel.topic and "Ticket for" in channel.topic:
+            try:
+                owner_id = int(channel.topic.split("for ")[1].split(" |")[0].strip())
+            except Exception:
+                pass
+        
+        member = None
+        if owner_id:
+            try:
+                member = await guild.fetch_member(owner_id)
+            except Exception:
+                pass
+        
+        if not member:
+            return {"error": "Could not identify the ticket owner to open a complaint."}
+        
+        complaint_channel = await create_ticket_logic(
+            guild, member, "Complaint", 
+            f"**Escalated Complaint Ticket (Created by {staff_name})**\n*Transferred from previous ticket: #{channel.name}*", 
+            COMPLAINT_CATEGORY_ID, 
+            None
+        )
+        
+        if not complaint_channel:
+            return {"error": "Failed to create complaint channel."}
+
+        await complaint_channel.send(f"📥 **Merged history from #{channel.name} (Escalated by {staff_name}):**")
+
+        async for message in channel.history(limit=100, oldest_first=True):
+            if message.author == bot.user and message.embeds: continue
+            content = f"**[Merged] {message.author.display_name}:** {message.content}"
+            files = []
+            for attachment in message.attachments:
+                file_bytes = await attachment.read()
+                files.append(discord.File(io.BytesIO(file_bytes), filename=attachment.filename))
+            if content.strip() or files:
+                await complaint_channel.send(content=content if content.strip() else None, files=files)
+                await asyncio.sleep(0.4)
+
+        await channel.send(f"🔒 Ticket escalated into a confidential Complaint channel. Deleting this channel in 5 seconds...")
+        await asyncio.sleep(5)
+        await channel.delete()
+        return {"success": True, "message": "Ticket escalated and merged into an HR-only Complaint ticket."}
+
+    # 5. MERGE INTO EXISTING CHANNEL ID
     elif command == "merge":
         target_channel_id = int(args.get("targetChannelId", 0))
         target_channel = channel.guild.get_channel(target_channel_id)
@@ -477,9 +525,9 @@ async def execute_web_command(channel_id: int, command: str, args: dict, staff_n
         await channel.send(f"⚠️ Merge complete into {target_channel.mention}. Deleting channel in 5 seconds...")
         await asyncio.sleep(5)
         await channel.delete()
-        return {"success": True, "message": "Ticket successfully merged and deleted."}
+        return {"success": True, "message": "Ticket successfully merged and closed."}
 
-    # 5. SEND MACRO TEMPLATE
+    # 6. SEND MACRO TEMPLATE
     elif command == "macro":
         macro_key = args.get("macroKey")
         macro_text = MACROS.get(macro_key)
