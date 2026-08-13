@@ -41,8 +41,9 @@ TRIAL_MOD_ROLE_ID = 1518663064956702890
 AUTO_ASSIGN_ENABLED = False 
 ASSIGNMENT_INDEX = 0 
 
-# --- TRANSLATION STATE STORE ---
+# --- TRANSLATION & CONCURRENCY LOCK STORES ---
 ACTIVE_TRANSLATIONS = {}
+CREATING_TICKETS = set()  # Lock set to prevent duplicate creation
 
 INACTIVITY_WARN_AFTER_HOURS = 24
 INACTIVITY_CLOSE_AFTER_HOURS = 48
@@ -138,95 +139,110 @@ async def translate_text(text: str, source: str = 'auto', target: str = 'en') ->
 
 async def create_ticket_logic(guild, member, ticket_type, questions, category_id, interaction: discord.Interaction):
     global AUTO_ASSIGN_ENABLED, ASSIGNMENT_INDEX
-    category = guild.get_channel(category_id)
-    if not category:
-        if interaction and not interaction.response.is_done():
-            return await interaction.followup.send("Error: Ticket category not found.", ephemeral=True)
-        return None
 
-    for channel in category.text_channels:
-        if channel.topic and str(member.id) in channel.topic:
-            if interaction and not interaction.response.is_done():
-                return await interaction.followup.send(f"{member.display_name} already has a ticket open here: {channel.mention}", ephemeral=True)
-            return channel
-
-    ticket_id = f"{ticket_type[:3].upper()}-{random.randint(1000, 9999)}-{random.randint(100, 999)}"
-    
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(read_messages=False),
-        member: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
-        guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True, manage_permissions=True)
-    }
-    
-    standard_staff_roles = [TRIAL_MOD_ROLE_ID, STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID]
-    supervisor_role = guild.get_role(SUPERVISOR_ROLE_ID)
-
-    assigned_trial = None
-    if AUTO_ASSIGN_ENABLED and ticket_type != "Complaint":
-        trial_role = guild.get_role(TRIAL_MOD_ROLE_ID)
-        inactive_role = guild.get_role(INACTIVITY_ROLE_ID)
-        if trial_role:
-            available_trials = [m for m in trial_role.members if not m.bot and (not inactive_role or inactive_role not in m.roles)]
-            available_trials.sort(key=lambda x: x.id)
-            if available_trials:
-                assigned_trial = available_trials[ASSIGNMENT_INDEX % len(available_trials)]
-                ASSIGNMENT_INDEX += 1
-                overwrites[assigned_trial] = discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True)
-
-    if ticket_type == "Complaint":
-        for role_id in standard_staff_roles:
-            role = guild.get_role(role_id)
-            if role: overwrites[role] = discord.PermissionOverwrite(read_messages=False)
-        if supervisor_role:
-            overwrites[supervisor_role] = discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True)
-    else:
-        all_ids = standard_staff_roles + [SUPERVISOR_ROLE_ID]
-        for role_id in all_ids:
-            role = guild.get_role(role_id)
-            if role:
-                if assigned_trial:
-                    can_talk = (role_id in [STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID])
-                else:
-                    can_talk = (role_id in [STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID]) or (not AUTO_ASSIGN_ENABLED)
-                overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=can_talk, attach_files=can_talk)
-
-    channel = await category.create_text_channel(
-        name=f"{ticket_type.lower()}-{member.name}",
-        overwrites=overwrites,
-        topic=f"Ticket for {member.id} | ID: {ticket_id}"
-    )
-
-    embed = discord.Embed(title=f"{ticket_type} Support Request", description=f"Hello {member.mention}!\n\n{questions}", color=discord.Color.blue())
-    view = TicketActionView(show_claim=(ticket_type != "Complaint"))
-    
-    if assigned_trial:
-        embed.add_field(name="Assigned Trial Moderator", value=f"{assigned_trial.mention}\n*Assigned and automatically claimed.*")
-        for item in view.children:
-            if isinstance(item, Button) and item.custom_id == "claim_ticket":
-                item.disabled = True
-                item.label = f"Claimed by {assigned_trial.display_name}"
-
-    await channel.send(embed=embed, view=view)
-    if assigned_trial:
-        await channel.send(f"{assigned_trial.mention}, you have been automatically assigned and claimed this ticket.")
-
-    # --- NEXT.JS WEB PORTAL SYNC TRIGGER ---
-    asyncio.create_task(send_to_nextjs("/api/support/sync/ticket", {
-        "ticketId": ticket_id,
-        "channelId": str(channel.id),
-        "discordUserId": str(member.id),
-        "userName": member.display_name,
-        "userAvatar": str(member.display_avatar.url) if member.display_avatar else "",
-        "ticketType": ticket_type,
-        "subject": f"{ticket_type} Support Request"
-    }))
-
-    if interaction:
+    # --- LOCK GUARD TO PREVENT DUPLICATE CREATION ---
+    if member.id in CREATING_TICKETS:
         try:
-            await interaction.followup.send(f"Ticket created: {channel.mention}", ephemeral=True)
+            await interaction.followup.send("⚠️ Your ticket is already being created, please wait...", ephemeral=True)
         except Exception:
             pass
-    return channel
+        return None
+
+    CREATING_TICKETS.add(member.id)
+
+    try:
+        category = guild.get_channel(category_id)
+        if not category:
+            if interaction and not interaction.response.is_done():
+                await interaction.followup.send("Error: Ticket category not found.", ephemeral=True)
+            return None
+
+        for channel in category.text_channels:
+            if channel.topic and str(member.id) in channel.topic:
+                if interaction and not interaction.response.is_done():
+                    await interaction.followup.send(f"{member.display_name} already has a ticket open here: {channel.mention}", ephemeral=True)
+                return channel
+
+        ticket_id = f"{ticket_type[:3].upper()}-{random.randint(1000, 9999)}-{random.randint(100, 999)}"
+        
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            member: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True, manage_permissions=True)
+        }
+        
+        standard_staff_roles = [TRIAL_MOD_ROLE_ID, STAFF_ROLE_ID, STAFF_LEAD_ROLE_ID]
+        supervisor_role = guild.get_role(SUPERVISOR_ROLE_ID)
+
+        assigned_trial = None
+        if AUTO_ASSIGN_ENABLED and ticket_type != "Complaint":
+            trial_role = guild.get_role(TRIAL_MOD_ROLE_ID)
+            inactive_role = guild.get_role(INACTIVITY_ROLE_ID)
+            if trial_role:
+                available_trials = [m for m in trial_role.members if not m.bot and (not inactive_role or inactive_role not in m.roles)]
+                available_trials.sort(key=lambda x: x.id)
+                if available_trials:
+                    assigned_trial = available_trials[ASSIGNMENT_INDEX % len(available_trials)]
+                    ASSIGNMENT_INDEX += 1
+                    overwrites[assigned_trial] = discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True)
+
+        if ticket_type == "Complaint":
+            for role_id in standard_staff_roles:
+                role = guild.get_role(role_id)
+                if role: overwrites[role] = discord.PermissionOverwrite(read_messages=False)
+            if supervisor_role:
+                overwrites[supervisor_role] = discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True)
+        else:
+            all_ids = standard_staff_roles + [SUPERVISOR_ROLE_ID]
+            for role_id in all_ids:
+                role = guild.get_role(role_id)
+                if role:
+                    if assigned_trial:
+                        can_talk = (role_id in [STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID])
+                    else:
+                        can_talk = (role_id in [STAFF_LEAD_ROLE_ID, SUPERVISOR_ROLE_ID]) or (not AUTO_ASSIGN_ENABLED)
+                    overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=can_talk, attach_files=can_talk)
+
+        channel = await category.create_text_channel(
+            name=f"{ticket_type.lower()}-{member.name}",
+            overwrites=overwrites,
+            topic=f"Ticket for {member.id} | ID: {ticket_id}"
+        )
+
+        embed = discord.Embed(title=f"{ticket_type} Support Request", description=f"Hello {member.mention}!\n\n{questions}", color=discord.Color.blue())
+        view = TicketActionView(show_claim=(ticket_type != "Complaint"))
+        
+        if assigned_trial:
+            embed.add_field(name="Assigned Trial Moderator", value=f"{assigned_trial.mention}\n*Assigned and automatically claimed.*")
+            for item in view.children:
+                if isinstance(item, Button) and item.custom_id == "claim_ticket":
+                    item.disabled = True
+                    item.label = f"Claimed by {assigned_trial.display_name}"
+
+        await channel.send(embed=embed, view=view)
+        if assigned_trial:
+            await channel.send(f"{assigned_trial.mention}, you have been automatically assigned and claimed this ticket.")
+
+        # --- NEXT.JS WEB PORTAL SYNC TRIGGER ---
+        asyncio.create_task(send_to_nextjs("/api/support/sync/ticket", {
+            "ticketId": ticket_id,
+            "channelId": str(channel.id),
+            "discordUserId": str(member.id),
+            "userName": member.display_name,
+            "userAvatar": str(member.display_avatar.url) if member.display_avatar else "",
+            "ticketType": ticket_type,
+            "subject": f"{ticket_type} Support Request"
+        }))
+
+        if interaction:
+            try:
+                await interaction.followup.send(f"Ticket created: {channel.mention}", ephemeral=True)
+            except Exception:
+                pass
+        return channel
+    finally:
+        if member.id in CREATING_TICKETS:
+            CREATING_TICKETS.remove(member.id)
 
 # --- MODALS ---
 class CloseTicketModal(Modal, title="Close Ticket"):
@@ -431,22 +447,25 @@ class TicketControlPanelView(View):
     @discord.ui.button(label="Server Support", style=discord.ButtonStyle.primary, custom_id="btn_server", emoji="🖥️")
     async def server_support(self, interaction: discord.Interaction, button: Button): 
         try:
-            if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
-        except Exception: pass
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            return  # Stop if interaction was already handled by another process!
         await create_ticket_logic(interaction.guild, interaction.user, "Server", MACROS["server_issue_questions"], TICKET_CATEGORY_ID, interaction)
 
     @discord.ui.button(label="Game Support", style=discord.ButtonStyle.success, custom_id="btn_game", emoji="🎮")
     async def game_support(self, interaction: discord.Interaction, button: Button): 
         try:
-            if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
-        except Exception: pass
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            return  # Stop if interaction was already handled by another process!
         await create_ticket_logic(interaction.guild, interaction.user, "Game", MACROS["game_support_questions"], TICKET_CATEGORY_ID, interaction)
 
     @discord.ui.button(label="File a Complaint", style=discord.ButtonStyle.danger, custom_id="btn_complaint", emoji="⚖️")
     async def complaint(self, interaction: discord.Interaction, button: Button): 
         try:
-            if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
-        except Exception: pass
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            return  # Stop if interaction was already handled by another process!
         await create_ticket_logic(interaction.guild, interaction.user, "Complaint", "Describe your complaint in detail.", COMPLAINT_CATEGORY_ID, interaction)
 
 # --- BOT SETUP ---
@@ -621,7 +640,6 @@ async def setup_tickets(interaction: discord.Interaction):
     
     await interaction.channel.send(embed=embed, view=TicketControlPanelView())
     
-    # Safe check to avoid 'Interaction has already been acknowledged' error
     if not interaction.response.is_done():
         await interaction.response.send_message("✅ Panel posted!", ephemeral=True)
     else:
@@ -688,7 +706,6 @@ async def on_ready():
     print(f"--- BOT IS ONLINE AS {bot.user.name} ---")
     try:
         guild = discord.Object(id=GUILD_ID)
-        # Copy global commands from memory to your guild
         bot.tree.copy_global_to(guild=guild)
         synced = await bot.tree.sync(guild=guild)
         print(f"✅ Synced {len(synced)} command(s) instantly to guild {GUILD_ID}!")
