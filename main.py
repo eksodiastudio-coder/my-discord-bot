@@ -620,7 +620,12 @@ async def setup_tickets(interaction: discord.Interaction):
     )
     
     await interaction.channel.send(embed=embed, view=TicketControlPanelView())
-    await interaction.response.send_message("✅ Panel posted!", ephemeral=True)
+    
+    # Safe check to avoid 'Interaction has already been acknowledged' error
+    if not interaction.response.is_done():
+        await interaction.response.send_message("✅ Panel posted!", ephemeral=True)
+    else:
+        await interaction.followup.send("✅ Panel posted!", ephemeral=True)
 
 @bot.tree.command(name="merge", description="Merge this ticket's history including images")
 async def merge(interaction: discord.Interaction, target_channel: discord.TextChannel):
