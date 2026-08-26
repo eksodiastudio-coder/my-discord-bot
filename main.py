@@ -37,7 +37,7 @@ NEXTJS_SYNC_URL = os.getenv("NEXTJS_SYNC_URL", "http://localhost:3000")
 WEB_SYNC_SECRET = os.getenv("WEB_SYNC_SECRET", "my_super_secret_key_123")
 
 # --- AUTO-ASSIGNMENT CONFIG ---
-TRIAL_MOD_ROLE_ID = 1518663064956702890 
+TRIAL_MOD_ROLE_ID = int(os.getenv("ROLE_ID_TRAIL_MODERATOR", os.getenv("TRIAL_MOD_ROLE_ID", "1518663064956702890")))
 AUTO_ASSIGN_ENABLED = False 
 ASSIGNMENT_INDEX = 0 
 
@@ -258,7 +258,7 @@ async def close_and_log_ticket(channel, closer_member, reason="No reason provide
     log_channel_id = COMPLAINT_LOG_CHANNEL_ID if channel.category_id == COMPLAINT_CATEGORY_ID else LOG_CHANNEL_ID
     log_channel = guild.get_channel(log_channel_id)
 
-    # --- SYNC CLOSE TO NEXT.JS WEB PORTAL ---
+    # 1. Sync close to Web Portal so it disappears from active list
     asyncio.create_task(send_to_nextjs("/api/support/sync/close", {
         "channelId": str(channel.id)
     }))
@@ -266,6 +266,7 @@ async def close_and_log_ticket(channel, closer_member, reason="No reason provide
     if channel.id in ACTIVE_TRANSLATIONS:
         ACTIVE_TRANSLATIONS.pop(channel.id, None)
 
+    # 2. Build full chat history
     messages = []
     async for message in channel.history(limit=None, oldest_first=True):
         messages.append(f"[{message.created_at.strftime('%Y-%m-%d %H:%M:%S')}] {message.author}: {message.clean_content}")
@@ -285,6 +286,7 @@ async def close_and_log_ticket(channel, closer_member, reason="No reason provide
 
     closer_mention = getattr(closer_member, 'mention', str(closer_member))
 
+    # 3. Post to Discord Log Channel (Acts as the database)
     log_embed = discord.Embed(title="Ticket Closed", color=discord.Color.orange(), timestamp=discord.utils.utcnow())
     log_embed.add_field(name="Ticket ID", value=f"`{ticket_id}`", inline=True)
     log_embed.add_field(name="Opened By", value=owner_member.mention if owner_member else "Unknown", inline=True)
@@ -303,7 +305,6 @@ async def close_and_log_ticket(channel, closer_member, reason="No reason provide
     await channel.send(f"**Closing Reason:** {reason}\nThis channel will be deleted in 5 seconds.")
     await asyncio.sleep(5)
     await channel.delete()
-
 # --- WEB CLOSE/CLAIM HELPERS ---
 async def close_ticket_from_web(channel_id: int, staff_name: str, reason: str = "Resolved via Web Dashboard"):
     channel = bot.get_channel(channel_id)
