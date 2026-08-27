@@ -5,6 +5,7 @@ import io
 import asyncio
 import os
 import aiohttp
+import re
 from discord.ext import commands, tasks
 from discord.ui import Button, View, Modal, TextInput
 from flask import Flask, request, jsonify
@@ -13,7 +14,7 @@ from discord import app_commands
 
 # --- TRANSLATION IMPORTS ---
 from deep_translator import GoogleTranslator
-from langdetect import detect
+from deep_translator.exceptions import LanguageNotSupportedException
 
 # --- KOYEB WEB SERVER SETUP ---
 app = Flask('')
@@ -128,14 +129,50 @@ class MockMember:
         self.name = name
         self.mention = f"**{name}**"
 
-async def translate_text(text: str, source: str = 'auto', target: str = 'en') -> str:
+# --- ADVANCED TRANSLATION ENGINE ---
+
+def _clean_text_for_translation(text: str) -> str:
+    """Removes discord mentions, markdown links, custom emojis, and URLs to prevent translation distortion."""
+    text = re.sub(r'<@!?\d+>|<@&\d+>|<#\d+>', '', text)
+    text = re.sub(r'<a?:\w+:\d+>', '', text)
+    text = re.sub(r'https?://\S+|www\.\S+', '', text)
+    return text.strip()
+
+def _sync_translate(text: str, source: str = 'auto', target: str = 'en') -> tuple[str, str]:
+    """
+    Synchronously translates text and extracts the source language.
+    Returns: (translated_text, detected_or_used_source_language)
+    """
     try:
         translator = GoogleTranslator(source=source, target=target)
-        translated = await asyncio.to_thread(translator.translate, text)
-        return translated
+        translated = translator.translate(text)
+        
+        detected_src = source
+        if source == 'auto':
+            # Attempt to extract detected language if exposed by deep-translator
+            detected_src = getattr(translator, '_source', 'auto')
+            if detected_src == 'auto' or not detected_src:
+                detected_src = 'unknown'
+
+        return translated, detected_src
     except Exception as e:
-        print(f"Translation Error: {e}")
-        return text
+        print(f"[Translation Engine Error] source={source} target={target} err={e}")
+        return text, source
+
+async def translate_text_advanced(text: str, source: str = 'auto', target: str = 'en') -> tuple[str, str]:
+    """
+    Asynchronously executes deep Google translation with cleaning and auto-fallback.
+    """
+    clean_text = _clean_text_for_translation(text)
+    if not clean_text or len(clean_text) < 2:
+        return text, source
+
+    return await asyncio.to_thread(_sync_translate, text, source, target)
+
+# Backwards compatible signature in case external commands reference translate_text
+async def translate_text(text: str, source: str = 'auto', target: str = 'en') -> str:
+    translated, _ = await translate_text_advanced(text, source, target)
+    return translated
 
 async def create_ticket_logic(guild, member, ticket_type, questions, category_id, interaction: discord.Interaction):
     global AUTO_ASSIGN_ENABLED, ASSIGNMENT_INDEX
@@ -305,6 +342,7 @@ async def close_and_log_ticket(channel, closer_member, reason="No reason provide
     await channel.send(f"**Closing Reason:** {reason}\nThis channel will be deleted in 5 seconds.")
     await asyncio.sleep(5)
     await channel.delete()
+
 # --- WEB CLOSE/CLAIM HELPERS ---
 async def close_ticket_from_web(channel_id: int, staff_name: str, reason: str = "Resolved via Web Dashboard"):
     channel = bot.get_channel(channel_id)
@@ -388,7 +426,7 @@ def http_claim_ticket():
     asyncio.run_coroutine_threadsafe(claim_ticket_from_web(channel_id, staff_name, staff_id), bot.loop)
     return jsonify({"success": True}), 200
 
-# NEW: Web-to-Bot Command Execution Endpoint
+# Web-to-Bot Command Execution Endpoint
 async def execute_web_command(channel_id: int, command: str, args: dict, staff_name: str):
     channel = bot.get_channel(channel_id)
     if not channel:
@@ -410,14 +448,15 @@ async def execute_web_command(channel_id: int, command: str, args: dict, staff_n
         
         ACTIVE_TRANSLATIONS[channel.id] = {
             "member_id": owner_id,
-            "member_lang": lang.lower() if lang else None
+            "member_lang": lang.lower() if lang else None,
+            "is_manual": bool(lang)
         }
-        lang_info = f"`{lang}`" if lang else "Auto-Detecting"
+        lang_info = f"`{lang}`" if lang else "Dynamic Multi-Language Detection"
         await channel.send(
             f"🌐 **Translation Enabled by {staff_name} (via Web Dashboard)**\n"
-            f"- Target language: {lang_info}\n"
-            f"- Member messages will translate to English.\n"
-            f"- Staff messages will translate to member's language."
+            f"- Target language mode: {lang_info}\n"
+            f"- Member messages will automatically translate to English.\n"
+            f"- Staff messages will translate back to the member's language."
         )
         return {"success": True, "message": f"Translation turned on ({lang_info})"}
 
@@ -657,7 +696,7 @@ class TicketControlPanelView(View):
         try:
             await interaction.response.defer(ephemeral=True)
         except Exception:
-            return  # Stop if interaction was already handled by another process!
+            return
         await create_ticket_logic(interaction.guild, interaction.user, "Server", MACROS["server_issue_questions"], TICKET_CATEGORY_ID, interaction)
 
     @discord.ui.button(label="Game Support", style=discord.ButtonStyle.success, custom_id="btn_game", emoji="🎮")
@@ -665,7 +704,7 @@ class TicketControlPanelView(View):
         try:
             await interaction.response.defer(ephemeral=True)
         except Exception:
-            return  # Stop if interaction was already handled by another process!
+            return
         await create_ticket_logic(interaction.guild, interaction.user, "Game", MACROS["game_support_questions"], TICKET_CATEGORY_ID, interaction)
 
     @discord.ui.button(label="File a Complaint", style=discord.ButtonStyle.danger, custom_id="btn_complaint", emoji="⚖️")
@@ -673,7 +712,7 @@ class TicketControlPanelView(View):
         try:
             await interaction.response.defer(ephemeral=True)
         except Exception:
-            return  # Stop if interaction was already handled by another process!
+            return
         await create_ticket_logic(interaction.guild, interaction.user, "Complaint", "Describe your complaint in detail.", COMPLAINT_CATEGORY_ID, interaction)
 
 # --- BOT SETUP ---
@@ -725,13 +764,14 @@ async def translateon(interaction: discord.Interaction, default_language: str = 
     
     ACTIVE_TRANSLATIONS[interaction.channel.id] = {
         "member_id": owner_id,
-        "member_lang": default_language.lower() if default_language else None
+        "member_lang": default_language.lower() if default_language else None,
+        "is_manual": bool(default_language)
     }
     
-    lang_info = f"'{default_language}'" if default_language else "Auto-Detecting"
+    lang_info = f"`{default_language.upper()}` (Locked)" if default_language else "Dynamic Auto-Detection"
     await interaction.response.send_message(
         f"🌐 **Translation Services Enabled.**\n"
-        f"- Target member language: `{lang_info}`\n"
+        f"- Target member language: **{lang_info}**\n"
         f"- Submissions from the member will translate to English.\n"
         f"- Submissions from staff translate to the member's target language."
     )
@@ -956,59 +996,54 @@ async def on_message(message: discord.Message):
     else:
         content = message.content.strip()
 
-    # Process automatic language translation if active in this ticket
+    # --- ADVANCED TRANSLATION PIPELINE ---
     if message.channel.id in ACTIVE_TRANSLATIONS and content:
         session = ACTIVE_TRANSLATIONS[message.channel.id]
-        member_id = session["member_id"]
-        member_lang = session["member_lang"]
+        member_id = session.get("member_id")
+        member_lang = session.get("member_lang")
+        is_manual = session.get("is_manual", False)
 
-        # Case A: Message sent by Ticket User -> Translate to English
+        # Case A: Message sent by Ticket Member -> Translate to English
         if not message.author.bot and message.author.id == member_id:
-            try:
-                detected_lang = await asyncio.to_thread(detect, content)
-            except Exception:
-                detected_lang = "en"
+            clean_text = _clean_text_for_translation(content)
+            
+            # Avoid translating meaningless/pure emojis/URLs/punctuations
+            if len(clean_text) >= 2:
+                source_to_use = member_lang if (member_lang and is_manual) else 'auto'
+                translated, detected_lang = await translate_text_advanced(content, source=source_to_use, target="en")
 
-            if member_lang is not None:
-                if detected_lang == member_lang or detected_lang != "en":
-                    translated = await translate_text(content, source=detected_lang, target="en")
-                    if translated and translated.lower() != content.lower():
-                        embed = discord.Embed(
-                            title="🌐 Translation to English",
-                            description=translated,
-                            color=discord.Color.blue()
-                        )
-                        embed.set_footer(text=f"Language: {detected_lang.upper()} | Auto-Translation")
-                        await message.channel.send(embed=embed)
-            else:
-                if detected_lang != "en":
-                    session["member_lang"] = detected_lang
-                    translated = await translate_text(content, source=detected_lang, target="en")
-                    if translated and translated.lower() != content.lower():
-                        embed = discord.Embed(
-                            title="🌐 Translation to English",
-                            description=translated,
-                            color=discord.Color.blue()
-                        )
-                        embed.set_footer(text=f"Detected & Locked: {detected_lang.upper()}")
-                        await message.channel.send(embed=embed)
+                # If text translated into something different and is meaningful
+                if translated and translated.strip().lower() != content.strip().lower():
+                    # Update dynamic detected language if not manually locked
+                    if not is_manual and detected_lang and detected_lang not in ('en', 'auto', 'unknown'):
+                        session["member_lang"] = detected_lang
 
-        # Case B: Message sent by Staff (via Web Dashboard OR Discord) -> Translate to User's Language
-        elif is_web_staff_reply or (not message.author.bot and message.author.id != member_id):
-            if member_lang and member_lang != "en":
-                translated = await translate_text(content, source="en", target=member_lang)
-                if translated and translated.lower() != content.lower():
                     embed = discord.Embed(
-                        title=f"🌐 Translation to {member_lang.upper()}",
+                        title="🌐 Translation to English",
+                        description=translated,
+                        color=discord.Color.blue()
+                    )
+                    lang_label = (member_lang or detected_lang or "Detected").upper()
+                    embed.set_footer(text=f"Detected: {lang_label} | Auto-Translation")
+                    await message.channel.send(embed=embed)
+
+        # Case B: Message sent by Staff (via Web Dashboard OR Discord) -> Translate to Member's Language
+        elif is_web_staff_reply or (not message.author.bot and message.author.id != member_id):
+            target_lang = session.get("member_lang")
+            
+            if target_lang and target_lang != "en":
+                translated, _ = await translate_text_advanced(content, source="en", target=target_lang)
+                if translated and translated.strip().lower() != content.strip().lower():
+                    embed = discord.Embed(
+                        title=f"🌐 Translation to {target_lang.upper()}",
                         description=translated,
                         color=discord.Color.green()
                     )
-                    embed.set_footer(text="Translated automatically for the user")
+                    embed.set_footer(text="Translated automatically for user")
                     await message.channel.send(embed=embed)
 
     # Next.js Web Message Sync Trigger
     if message.channel.category_id in [TICKET_CATEGORY_ID, COMPLAINT_CATEGORY_ID]:
-        # Web staff replies are already saved in Next.js store, so avoid double-syncing them
         if not is_web_staff_reply:
             attachments = [att.url for att in message.attachments]
             asyncio.create_task(send_to_nextjs("/api/support/sync/message", {
@@ -1023,7 +1058,7 @@ async def on_message(message: discord.Message):
             }))
 
     await bot.process_commands(message)
-    
+
 if __name__ == "__main__":
     keep_alive()
     if BOT_TOKEN: bot.run(BOT_TOKEN)
